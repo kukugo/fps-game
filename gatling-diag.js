@@ -1,0 +1,3740 @@
+
+const fs = require('fs');
+const path = require('path');
+const dir = path.dirname(path.resolve(__filename));
+const THREE = require('./vendor/three.min.js');
+const fakeCtx = () => new Proxy({
+  createImageData: (w, h) => ({ data: new Uint8Array(w * h * 4) }),
+  getImageData: (x, y, w, h) => ({ data: new Uint8Array(w * h * 4) })
+}, {
+  get: (t, k) => (k in t ? t[k] : () => ({ width: 10, addColorStop: () => {} }))
+});
+globalThis.document = {
+  addEventListener: () => {},
+  exitPointerLock: () => {},
+  createElement: () => ({ width: 0, height: 0, getContext: fakeCtx, addEventListener: () => {} }),
+  getElementById: () => ({ clientWidth: 900, style: {}, addEventListener: () => {}, classList: { add(){}, remove(){}, toggle(){} } })
+};
+globalThis.addEventListener = () => {};
+
+'use strict';
+
+/* ============================================================
+   霓虹突击 · NEON STRIKE — 第一人称射击
+   Three.js r160 (UMD) · 全部几何体程序化生成，不依赖任何外部资源
+   ============================================================ */
+
+const $ = id => document.getElementById(id);
+const el = {
+  stage: $('stage'), hpFill: $('hpFill'), hpText: $('hpText'), hpBar: $('hpBar'),
+  ammo: $('ammoText'), weapon: $('weaponText'), dash: $('dash'), dashText: $('dashText'),
+  wave: $('waveText'), score: $('scoreText'),
+  overlay: $('overlay'), ovTitle: $('ovTitle'), ovBody: $('ovBody'), ovKeys: $('ovKeys'), ovBtn: $('ovBtn'),
+  cross: $('cross'), hitmark: $('hitmark'), dmg: $('dmg'), lowhp: $('lowhp'), lookMode: $('lookmode'),
+  bossWrap: $('bossWrap'), bossFill: $('bossFill'), loading: $('loading'),
+  banner: $('waveBanner')
+};
+
+/* ---------- 工具 ---------- */
+const rand  = (a, b) => a + Math.random() * (b - a);
+const randI = (a, b) => Math.floor(rand(a, b + 1));
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+// 圆柱几何体的默认轴是局部 +Y；strut() 要把"两点连线"转成 quaternion，就用它当基准方向。
+const AXIS_Y = new THREE.Vector3(0, 1, 0);
+
+/* ---------- 常量 ---------- */
+const ARENA = 28;                 // 场地半宽（正方形 56x56）
+const WALL_H = 7;
+const EYE_H = 1.65;               // 视高
+const P_R = 0.45;                 // 玩家碰撞半径
+const WALK = 6.4, SPRINT = 10.6, ACCEL = 13, FRICTION = 11;
+const GRAVITY = 22, JUMP_V = 6.4;
+const MAG = 30;                      // 初始弹匣（切枪后按武器定义重置）
+const SENS = 0.0022;
+const TURN_RATE = 2.4;          // 自由模式：光标贴边时的持续转向速度（弧度/秒）
+const RECOIL_RECOVER = 0.42;    // 枪口上跳回收速度（弧度/秒）
+let lastX = null, lastY = null;   // 自由模式下光标的上一位置
+let edgeDX = 0, edgeDY = 0;       // 光标撞到窗口边缘时的持续转向方向
+
+/* ============================================================
+   1. 场景
+   ============================================================ */
+const canvas = $('game');
+let renderer, scene, camera, clock;
+
+function initThree() {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.25;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0c1018);
+  scene.fog = new THREE.Fog(0x0c1018, 26, 84);
+
+  camera = new THREE.PerspectiveCamera(76, 1, 0.05, 220);
+  camera.rotation.order = 'YXZ';
+  camera.position.set(0, EYE_H, ARENA * 0.55);
+  scene.add(camera);
+
+  scene.add(new THREE.HemisphereLight(0x6b8fd0, 0x1a1d28, 0.95));
+  const sun = new THREE.DirectionalLight(0xdce8ff, 1.35);
+  sun.position.set(16, 34, 10);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1536, 1536);
+  const S = ARENA + 8;
+  sun.shadow.camera.left = -S; sun.shadow.camera.right = S;
+  sun.shadow.camera.top = S;   sun.shadow.camera.bottom = -S;
+  sun.shadow.camera.near = 1; sun.shadow.camera.far = 100;
+  sun.shadow.bias = -0.0012;
+  scene.add(sun);
+
+  // 视图模型补光：相机随身的一盏小射灯。
+  // 真实 FPS 都会单独给武器打光，否则在暗场景里枪只剩一个剪影。
+  // 用 layers 把这盏灯限制在图层 1（只有视图模型在图层 1），
+  // 这样它只照亮手里的枪，不会在地上拖出一圈假的光斑。
+  const gunKey = new THREE.PointLight(0xffe0b4, 5.2, 2.8, 2);
+  gunKey.position.set(0.42, 0.30, -0.18);
+  gunKey.layers.set(1);
+  camera.add(gunKey);
+  // 冷色补光，从左下方勾边，避免枪变成一坨黑
+  const gunFill = new THREE.PointLight(0x74b6ff, 3.2, 2.6, 2);
+  gunFill.position.set(-0.36, -0.06, -0.34);
+  gunFill.layers.set(1);
+  camera.add(gunFill);
+  camera.layers.enable(1);      // 相机要能看到图层 1
+
+
+  clock = new THREE.Clock();
+  resize();
+  addEventListener('resize', resize);
+}
+
+/** 世界几何（必须在 initMaterials 之后调用，因为要用到材质） */
+function buildWorld() {
+  // 地面（真实混凝土）
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(ARENA * 2 + 8, ARENA * 2 + 8),
+    MAT.floor
+  );
+  ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // 墙体（金属压筋板）
+  const trimMat = new THREE.MeshStandardMaterial({
+    color: 0x0a0e1c, emissive: 0x35e6ff, emissiveIntensity: 1.6, roughness: 0.4, metalness: 0.2
+  });
+  const L = ARENA * 2;
+  const mkWall = (w, d, x, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, WALL_H, d), MAT.wall);
+    m.position.set(x, WALL_H / 2, z);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+    // 顶部霓虹条
+    const t = new THREE.Mesh(new THREE.BoxGeometry(w, 0.16, d), trimMat);
+    t.position.set(x, WALL_H - 0.12, z);
+    scene.add(t);
+    // 底部踢脚（防撞条）
+    const k = new THREE.Mesh(new THREE.BoxGeometry(w * 1.002, 0.34, d * 1.05), MAT.pipe);
+    k.position.set(x, 0.17, z);
+    k.receiveShadow = true;
+    scene.add(k);
+  };
+  mkWall(L + 4, 2, 0, -ARENA - 1); mkWall(L + 4, 2, 0, ARENA + 1);
+  mkWall(2, L + 4, -ARENA - 1, 0); mkWall(2, L + 4, ARENA + 1, 0);
+
+  // 天花板 + 钢桁架 + 吊灯（让场景成为一个封闭的工业空间）
+  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(L + 4, L + 4), MAT.ceiling);
+  ceil.rotation.x = Math.PI / 2;
+  ceil.position.y = WALL_H;
+  scene.add(ceil);
+  const beamMat = MAT.pipe;
+  for (let i = -2; i <= 2; i++) {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(L + 4, 0.42, 0.3), beamMat);
+    b.position.set(0, WALL_H - 0.25, i * 11);
+    b.castShadow = true;
+    scene.add(b);
+    // 桁架斜撑
+    for (let k = -3; k <= 3; k++) {
+      const br = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, 3.4), beamMat);
+      br.position.set(k * 8, WALL_H - 0.62, i * 11);
+      br.rotation.x = (k % 2 ? 1 : -1) * 0.72;
+      scene.add(br);
+    }
+  }
+  // 沿墙的管道
+  for (const [ax, az, rot, len] of [[0, -ARENA - 0.4, 0, L], [0, ARENA + 0.4, 0, L],
+                                   [-ARENA - 0.4, 0, Math.PI / 2, L], [ARENA + 0.4, 0, Math.PI / 2, L]]) {
+    for (let p = 0; p < 2; p++) {
+      const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.16 - p * 0.05, 0.16 - p * 0.05, len, 10), MAT.pipe);
+      pipe.rotation.z = Math.PI / 2;
+      pipe.rotation.y = rot;
+      pipe.position.set(ax + (rot ? 0 : 0), 4.6 + p * 0.55, az + (rot ? 0 : 0));
+      pipe.castShadow = true;
+      scene.add(pipe);
+    }
+  }
+  // 天花灯具（发光面板 + 点光源）
+  // 点光源数量是逐片元成本的主要来源：只放 2 盏真实灯，
+  // 其余位置靠发光面板 + 环境贴图撑起亮度，省下的开销留给贴图细节。
+  const lampMat = new THREE.MeshBasicMaterial({ color: 0xfff0d2, toneMapped: false });
+  const lampPos = [[-11, -11], [11, 11], [-11, 11], [11, -11]];
+  lampPos.forEach(([x, z], i) => {
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.3, 1.5), beamMat);
+    housing.position.set(x, WALL_H - 0.42, z);
+    scene.add(housing);
+    const panel = new THREE.Mesh(new THREE.PlaneGeometry(3.1, 1.2), lampMat);
+    panel.rotation.x = Math.PI / 2;
+    panel.position.set(x, WALL_H - 0.58, z);
+    scene.add(panel);
+    if (i < 2) {                       // 只有 2 盏是真的光源
+      const pl = new THREE.PointLight(0xffe3b8, 420, 52, 2);
+      pl.position.set(x, WALL_H - 1.0, z);
+      scene.add(pl);
+    }
+  });
+
+  // 掩体柱
+  const boxes = [];
+  const spots = [
+    [-12, -10, 3.2, 3.2, 3.4], [11, -12, 4.2, 2.6, 4.6], [-8, 13, 2.8, 4.4, 2.8],
+    [14, 9, 3.6, 3.6, 5.0], [0, -3, 2.4, 2.4, 2.6], [-16, 3, 2.2, 5.0, 2.4],
+    [5, 18, 4.6, 2.2, 3.0], [-3, -19, 3.4, 3.4, 3.4]
+  ];
+  for (const [x, z, w, d, h] of spots) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), MAT.pillar);
+    m.position.set(x, h / 2, z);
+    m.castShadow = true; m.receiveShadow = true;
+    scene.add(m);
+    coverMeshes.push(m);      // 玩家的射线会被这根柱子挡住
+    // 顶部发光边
+    const e = new THREE.Mesh(new THREE.BoxGeometry(w * 1.01, 0.12, d * 1.01), trimMat);
+    e.position.set(x, h - 0.1, z);
+    scene.add(e);
+    // 柱角护条
+    for (const sx of [1, -1]) {
+      const c = new THREE.Mesh(new THREE.BoxGeometry(0.14, h * 0.96, 0.14), MAT.pipe);
+      c.position.set(x + sx * (w / 2 - 0.05), h / 2, z + (d / 2 - 0.05));
+      c.castShadow = true;
+      scene.add(c);
+    }
+    boxes.push({ x: x - w / 2, z: z - d / 2, w, d, h });
+  }
+  // 掩体参与碰撞
+  obstacles = boxes;
+
+  // 角落氛围灯（2 盏，够用且省开销）
+  for (const [x, z, c] of [[-ARENA + 5, -ARENA + 5, 0x35e6ff], [ARENA - 5, ARENA - 5, 0xc04dff]]) {
+    const l = new THREE.PointLight(c, 190, 30, 2);
+    l.position.set(x, 5.2, z);
+    scene.add(l);
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.32, 12, 10),
+      new THREE.MeshBasicMaterial({ color: c, toneMapped: false }));
+    bulb.position.copy(l.position);
+    scene.add(bulb);
+  }
+
+  clock = new THREE.Clock();
+  resize();
+  addEventListener('resize', resize);
+}
+function resize() {
+  const w = el.stage.clientWidth;
+  const h = Math.round(w * 0.6);
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+
+/* ---------- 程序化贴图 ---------- */
+let glowTex = null;
+function makeGlowTexture() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0.00, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.18, 'rgba(255,255,255,0.55)');
+  grd.addColorStop(0.45, 'rgba(255,255,255,0.16)');
+  grd.addColorStop(1.00, 'rgba(255,255,255,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function addGlow(parent, color, size, opacity = 0.9) {
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, color: new THREE.Color(color), blending: THREE.AdditiveBlending,
+    transparent: true, depthWrite: false, opacity, toneMapped: false
+  }));
+  s.scale.set(size, size, 1);
+  parent.add(s);
+  return s;
+}
+function neonMat(color, emissive, ei = 1.2, rough = 0.4, metal = 0.4) {
+  return new THREE.MeshStandardMaterial({
+    color, emissive: new THREE.Color(emissive), emissiveIntensity: ei, roughness: rough, metalness: metal
+  });
+}
+
+/* ============================================================
+   2. 状态
+   ============================================================ */
+const player = {
+  x: 0, z: ARENA * 0.55, y: EYE_H, vy: 0,
+  hp: 100, maxHp: 100, yaw: Math.PI, pitch: 0,
+  vx: 0, vz: 0, grounded: true,
+  mag: MAG, magSize: MAG, reloadT: 0, fireCd: 0,
+  weapon: 0, spreadHeat: 0,
+  rapid: 0, recoil: 0, recoilPitch: 0, bob: 0, swayX: 0, swayY: 0,
+  score: 0, combo: 0, comboT: 0, dashCd: 0, inv: 0
+};
+let state = 'menu';              // menu | playing | paused | dead
+let wave = 0, waveTimer = 0, kills = 0, bestCombo = 0, collected = 0;
+let shake = 0, hitFlash = 0, dmgFlash = 0, banner = null;
+let gameTime = 0;                    // 游戏内累计时间（调试钩子用）
+let enemies = [], bullets = [], pickups = [], obstacles = [];
+
+const keys = Object.create(null);
+const mouse = { down: false, locked: false, dx: 0, dy: 0 };
+const raycaster = new THREE.Raycaster();
+const hitTargets = [];
+const coverMeshes = [];    // 掩体实体：玩家的射线也要被它挡住（和敌人子弹保持一致）
+const _sdir = new THREE.Vector3(), _sright = new THREE.Vector3(), _sup = new THREE.Vector3();
+const projLog = [];        // 调试：记录每次投射物生成（kind: 'bullet' | 'thrown'）
+const flashes = [];        // 敌人开火/爆炸的临时闪光
+/* ============================================================
+   3. 武器视图模型
+   ============================================================ */
+/* ---------- 武器系统 ---------- */
+/* spread = 基础散布角（弧度），heat = 连射升温系数（决定散布增长多快） */
+const WEAPONS = [
+  { id: 'pistol',  name: '脉冲手枪', dmg: 26, fireCd: 0.11,  spread: 0.012, mag: 30,  reload: 1.35, recoil: 0.0090, heat: 0.10, sfx: 'shoot'   },
+  { id: 'gatling', name: '加特林',   dmg: 13, fireCd: 0.042, spread: 0.030, mag: 220, reload: 2.70, recoil: 0.0042, heat: 0.30, sfx: 'gatling' }
+];
+let gunViews = [], gun, gunGlow, muzzleFlash, muzzleLight, recoilSpring = 0;
+let gunPose = null;          // 定妆照：固定视图模型位姿（null = 跟随游戏）
+
+/** 一根直杆：沿 from → to 的连线生成圆柱。
+ *  支架、导轨这类"两点之间"的杆件用这个函数最省事：长度自动算出来，
+ *  端点和杆身永远对得上，也不用手算欧拉角（手算最容易写出"脚垫对不上腿"的错位）。
+ *  from / to 用**同一个坐标系**（这里是枪械局部坐标）。 */
+function strut(from, to, r, mat, seg = 10) {
+  const dir = to.clone().sub(from);
+  const len = dir.length();
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, seg), mat);
+  m.quaternion.setFromUnitVectors(AXIS_Y, dir.normalize());
+  m.position.copy(from).add(to).multiplyScalar(0.5);   // 中点
+  return m;
+}
+
+function buildWeapon(kind) {
+  const g = new THREE.Group();
+  // 分区材质：套筒/机匣/枪管/聚合物/不锈钢各有自己的表面处理
+  const SLIDE = MAT.gunSlide, FRAME = MAT.gunFrame, BARREL = MAT.gunBarrel;
+  const POLY = MAT.gunPoly, DARK = MAT.gunDark, STEEL = MAT.gunSteel;
+  let flashPos = [0, 0.02, -0.82], flashScale = 0.8;
+  let rotor = null;          // 只包含"会跟着枪管转"的零件
+
+  if (kind === 'gatling') {
+    const TUBE = MAT.gunTube, SHROUD = MAT.gunShroud, DRUM = MAT.gunDrum;
+    // 机匣（每个面单独打散 UV，避免 6 个面贴同一张图；棱角做圆角，靠真实高光转折）
+    const receiver = new THREE.Mesh(
+      offsetBoxFaces(roundedBox(0.2, 0.19, 0.44, 0.014, 3), 11), FRAME);
+    // 六管转轮 —— **只有这一组会跟着枪管转**
+    // 坐标约定：机匣在枪械局部 z ∈ [-0.22, +0.22]，枪管轴线在 y = +0.035。
+    // 转子组 rotor 放在 z = 0（与机匣同平面），各零件直接用**枪械局部 z** 排布，
+    // 免得"转子偏移 + 子物体偏移"两层叠加后对不上。
+    // ⚠️ 凡挂进 rotor 的零件都会跟着枪管一起转，所以这里只能放"装在枪管束上、或与轴心同心"的东西：
+    //    枪管、枪管口箍、轮毂、蛛爪、消焰器。散热笼、两脚支架、机匣、弹鼓一律挂在静止的枪身 g 上。
+    rotor = new THREE.Group();
+    rotor.position.set(0, 0.035, 0);
+    // 每根枪管用独立的 UV 相位，六根管子才不会长得一模一样
+    const barrelGeo = new THREE.CylinderGeometry(0.026, 0.03, 0.8, 18, 1);
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU;
+      const geo = barrelGeo.clone();
+      // 沿管轴平移 UV（不是旋转几何体）—— 相当于把车削纹在管子上错开
+      const uv = geo.attributes.uv;
+      const phase = (i * 0.37) % 1;
+      for (let k = 0; k < uv.count; k++) uv.setX(k, (uv.getX(k) + phase) % 1);
+      uv.needsUpdate = true;
+      const b = new THREE.Mesh(geo, TUBE);
+      b.rotation.x = Math.PI / 2;
+      // 枪管后端 z = -0.15，**插进机匣里面**（机匣前端在 z = -0.22）
+      b.position.set(Math.cos(a) * 0.058, Math.sin(a) * 0.058, -0.55);
+      rotor.add(b);
+      // 枪管口箍：真实加特林每根管子前端都有一圈磨亮的口箍
+      const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, 0.035, 16), SHROUD);
+      collar.rotation.x = Math.PI / 2;
+      collar.position.set(Math.cos(a) * 0.058, Math.sin(a) * 0.058, -0.88);
+      rotor.add(collar);
+    }
+    // 轮毂 + 蛛爪（把六根管子铆在转子上的支架，跟着转子转）
+    // 轮毂半径 0.070：比枪管束的外径 0.088 小一圈，蛛爪才能从轮毂里伸出去够到管子。
+    // 轮毂 z = -0.27（跨 z ∈ [-0.335, -0.205]，前端抵进机匣前端面 15mm）—— 以前中心在
+    // z = -0.16，转动的轮毂一路伸到 z = -0.095，正压在机匣顶盖（顶盖 z 从 -0.20 起）底下：
+    // 轮毂顶面在 y = 0.123，比顶盖的 0.091~0.117 还高，等于每转一圈就从顶盖里"犁"出来一次。
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.070, 0.070, 0.13, 20), TUBE);
+    hub.rotation.x = Math.PI / 2; hub.position.z = -0.27;
+    rotor.add(hub);
+    // 蛛爪：径向长 0.088，从半径 0.040 摆到 0.084 —— 外端钻进枪管（枪管内缘 0.028、外径 0.088）
+    // 但停在静止导轨内缘 0.091 之前，留 7mm 间隙；转子转起来不会去撞那三根导轨。
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * TAU + 0.52;
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(0.016, 0.088, 0.03), DARK);
+      arm.position.set(Math.cos(a) * 0.040, Math.sin(a) * 0.040, -0.30);
+      arm.rotation.z = a - Math.PI / 2;
+      rotor.add(arm);
+    }
+    // 散热套筒：不是一个光溜溜的圆筒，而是**带纵向散热槽的笼式套筒**，而且它是**静止件**。
+    // 之前用 openEnded 的整圆筒，把六根枪管全挡在里面 —— 贴图再好也看不见。
+    // 改成：两道**真正的环**（Torus，中间有孔）+ 若干根纵向支柱，枪管从支柱之间露出来。
+    // 注意：之前用 CylinderGeometry 做"环"，那是**实心圆盘**，直接把枪管挡死了；
+    // 而且笼子的半径 0.118 比枪管束（0.086）大出 3cm，整圈悬在枪管外面。
+    // ⚠️ 笼子原先挂在转子组上，开火时整截笼子（连同两条支架腿）跟着枪管绕圈，看起来就成了
+    //    "整把枪头都在转"。真加特林的前导环 / 笼架是装在机匣前端的**固定结构**，六根管子
+    //    是在笼子里空转的 —— 所以笼子挂在静止的枪身 g 上，下面三根导轨负责把它接回机匣。
+    const shroud = new THREE.Group();
+    shroud.position.set(0, 0.035, -0.57);   // y = 枪管轴线：挂到静止枪身上，要把转子那 +0.035 自己补回来
+    for (const zz of [-0.15, 0.15]) {
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.104, 0.014, 8, 24), SHROUD);
+      ring.position.z = zz;              // TorusGeometry 本来就躺在 XY 平面，轴向就是 Z
+      shroud.add(ring);
+    }
+    // 纵向支柱（8 根），之间留出散热缝。半径 0.104 → 支柱 / 环的内缘 0.090~0.091，
+    // 和旋转枪管的外径 0.088 之间留 2~3mm 间隙：管子要在笼子里空转，这个间隙是**必须**的，
+    // 不然一转就变成"笼子裹着管子一起拧麻花"。
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * TAU + 0.39;
+      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.026, 0.022, 0.30), SHROUD);
+      bar.position.set(Math.cos(a) * 0.104, Math.sin(a) * 0.104, 0);
+      bar.rotation.z = a;
+      shroud.add(bar);
+    }
+    g.add(shroud);
+    // 三根承重导轨（右 / 左 / 下，和笼子同一个圆周），把静止的笼子接回机匣前端。
+    // 这一截不能省：笼子从转子挪出去之后就没有任何零件拽着它了，整笼加两脚支架会变成一个
+    // 悬空分量（装配连通性自检立刻报错）。导轨内缘 0.091，和旋转枪管同样留 3mm 间隙。
+    for (const ang of [0, Math.PI, -Math.PI / 2]) {
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(0.026, 0.026, 0.27), SHROUD);
+      rail.position.set(Math.cos(ang) * 0.104, 0.035 + Math.sin(ang) * 0.104, -0.315);
+      g.add(rail);
+    }
+    // 两脚支架 —— 装在**静止的笼子前环**上（真枪的支架装在机匣 / 前导环上，从不随枪管转）。
+    // 用 strut() 按两个端点直接生成圆柱：腿长自动算，端点永远对得上，也不用手算欧拉角。
+    // 腿要**往下、往外撇、再略微往前**；顶端埋进前环管体，用铰接座真正接到静止件上，
+    // 不然"看着像装在笼子上"其实还是悬空。铰接座薄边朝径向，内缘 0.101，留开旋转间隙。
+    for (const s of [1, -1]) {
+      const top = new THREE.Vector3(s * 0.085, -0.025, -0.72);   // 腿的顶端（前环圆周上）
+      const end = new THREE.Vector3(s * 0.165, -0.285, -0.78);   // 腿的底端
+      const dn = end.clone().sub(top).normalize();               // 腿的朝向（朝下）
+      g.add(strut(top, end, 0.012, TUBE));
+      const ang = Math.atan2(top.y - 0.035, top.x);              // 从前环轴心量到的安装角
+      const hinge = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.045, 0.06), DARK);
+      hinge.position.set(Math.cos(ang) * 0.112, 0.035 + Math.sin(ang) * 0.112, -0.723);
+      hinge.rotation.z = ang;                                    // 局部 x = 径向
+      g.add(hinge);
+      // 脚垫：薄板，板面**垂直于腿**（水平摆一块板，看着就是贴歪了）
+      const foot = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.018, 0.05), DARK);
+      foot.quaternion.setFromUnitVectors(AXIS_Y, dn);
+      foot.position.copy(end).addScaledVector(dn, 0.012);
+      g.add(foot);
+    }
+    // 消焰器：锥形喇叭口（真实加特林前端都有），内壁更黑、外壁被火药熏黄
+    // y 必须和枪管轴线一致（rotor 局部 y = 0），之前多给了 0.035，整个喇叭口浮在枪管上方。
+    // 它是装在枪管束前端的**旋转消焰器**，跟着转子转是对的：它和轴心同心，回转本身看不出来，
+    // 不会像支架那样让人误以为"整把枪都在转"。
+    const brake = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.108, 0.10, 20, 1, true), SHROUD);
+    brake.rotation.x = Math.PI / 2; brake.position.set(0, 0, -0.95);
+    rotor.add(brake);
+    const brakeRim = new THREE.Mesh(new THREE.TorusGeometry(0.108, 0.008, 6, 22), TUBE);
+    brakeRim.position.set(0, 0, -0.995);
+    rotor.add(brakeRim);
+    // 弹鼓
+    const drum = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 0.2, 28), DRUM);
+    drum.rotation.z = Math.PI / 2; drum.position.set(0.14, -0.17, 0.06);
+    const drumFace = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.205, 16), TUBE);
+    drumFace.rotation.z = Math.PI / 2; drumFace.position.set(0.14, -0.17, 0.06);
+    // 供弹槽 + 握把 + 提把
+    const feed = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.1, 0.32), POLY);
+    feed.position.set(0.11, -0.09, 0.0); feed.rotation.z = -0.22;
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.26, 0.12), POLY);
+    grip.position.set(0, -0.2, 0.17); grip.rotation.x = 0.2;
+    const carry = new THREE.Mesh(new THREE.TorusGeometry(0.07, 0.016, 6, 14, Math.PI), STEEL);
+    carry.position.set(-0.12, -0.02, 0.02); carry.rotation.set(0, Math.PI / 2, 0.3);
+    const cell = new THREE.Mesh(new THREE.SphereGeometry(0.05, 12, 10),
+      new THREE.MeshBasicMaterial({ color: 0x35e6ff, toneMapped: false }));
+    cell.position.set(-0.11, 0.03, -0.02);
+    // 机匣散热槽
+    for (let i = 0; i < 5; i++) {
+      const slot = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.085, 0.018), DARK);
+      slot.position.set(0.098, 0.02, -0.1 + i * 0.055);
+      receiver.add(slot);
+    }
+    // 机匣顶盖（带提手安装孔）
+    const topCap = new THREE.Mesh(offsetBoxFaces(roundedBox(0.16, 0.026, 0.36, 0.010, 2), 23), SLIDE);
+    topCap.position.set(0, 0.104, -0.02);
+    receiver.add(topCap);
+    // 机匣侧面加强筋（真实加特林机匣是带铸造加强筋的，不是光板一块）
+    // 加强筋只放在前后两端，中间留出刻字的位置
+    for (const s of [1, -1]) {
+      for (const zz of [-0.185, 0.185]) {
+        const rib = new THREE.Mesh(roundedBox(0.012, 0.13, 0.035, 0.005, 2), FRAME);
+        rib.position.set(s * 0.099, 0.0, zz);
+        receiver.add(rib);
+      }
+    }
+    // 机匣侧面的固定螺栓（四个小圆头，放在刻字上方）
+    for (const s of [1, -1]) {
+      for (const zz of [-0.185, 0.185]) {
+        const bolt = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.006, 8), STEEL);
+        bolt.rotation.z = Math.PI / 2;
+        bolt.position.set(s * 0.101, 0.058, zz);
+        receiver.add(bolt);
+      }
+    }
+
+    [receiver, rotor, drum, drumFace, feed, grip, carry, cell].forEach(m => g.add(m));
+    g.userData.cells = [cell];
+    g.userData.rotor = rotor;      // 全枪唯一会跟着枪管转的一组
+    // 机匣激光刻字（两侧，文字顺着机匣长度方向排布）
+    g.add(makeMarking(0.24, 0.05, 0.1015, -0.015, -0.04, [
+      { text: 'ROTARY Mk-IV', size: 40 },
+      { text: '7.62 × 51', size: 30, gap: 1.2 }
+    ], 1));
+    g.add(makeMarking(0.24, 0.05, -0.1015, -0.015, -0.04, [
+      { text: 'ROTARY Mk-IV', size: 40 },
+      { text: '7.62 × 51', size: 30, gap: 1.2 }
+    ], -1));
+    // 枪口闪光落在消焰器口（z = -1.0），之前挂在 -0.92，正好在枪管中间
+    flashPos = [0, 0.035, -1.02]; flashScale = 1.05;
+  } else {
+    // ============ 脉冲手枪 ============
+    // 套筒（发蓝钢）
+    const slide = new THREE.Mesh(new THREE.BoxGeometry(0.155, 0.11, 0.46), SLIDE);
+    slide.position.set(0, 0.055, -0.16);
+    const slideTop = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.02, 0.44), MAT.gunSlideTop);
+    slideTop.position.set(0, 0.118, -0.16);
+    // 套筒前端斜切（真实手枪的套筒前端是斜的）
+    // 注意：bevel 是 slide 的子物体，position 用的是**套筒局部坐标**。
+    // 之前写成枪械坐标 (0, 0.098, -0.385) —— 套筒自身中心在 y=0.055 / z=-0.16，
+    // 于是这块斜切片被甩到套筒上方 4cm、悬空在枪前面。
+    const bevel = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.05, 0.04), MAT.gunSlideTop);
+    bevel.position.set(0, 0.030, -0.205); bevel.rotation.x = -0.45;
+    slide.add(bevel);
+    // 前部防滑纹（较粗的 6 道，靠套筒前端 = 局部 -Z 方向）
+    // 侧向只外凸 1.5mm（套筒半宽 0.0775，肋条半宽 0.006 → 中心取 0.073）；
+    // 之前中心在 0.079，肋条整条浮在套筒外 7.5mm。
+    for (let i = 0; i < 6; i++) {
+      for (const s of [1, -1]) {
+        const ser = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.085, 0.016), DARK);
+        ser.position.set(s * 0.073, -0.005, -0.185 + i * 0.026);
+        slide.add(ser);
+      }
+    }
+    // 后部防滑纹（套筒尾部，更细密的 4 道）
+    for (let i = 0; i < 4; i++) {
+      for (const s of [1, -1]) {
+        const ser = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.078, 0.013), DARK);
+        ser.position.set(s * 0.073, -0.005, 0.115 + i * 0.022);
+        slide.add(ser);
+      }
+    }
+    // 抛壳口 + 抛壳窗上沿的钢唇
+    // 之前 port 的局部 y = 0.075，而套筒自身半高只有 0.055 → 整块抛壳口浮在套筒上方 2cm。
+    const port = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.05, 0.11), DARK);
+    port.position.set(0.0755, 0.020, -0.03);
+    slide.add(port);
+    const portLip = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.008, 0.11), STEEL);
+    portLip.position.set(0.0755, 0.045, -0.03);
+    slide.add(portLip);
+    // 抛壳口盖板（压在抛壳口后缘，凸出 1mm）
+    const ejector = new THREE.Mesh(new THREE.BoxGeometry(0.005, 0.046, 0.05), STEEL);
+    ejector.position.set(0.0755, 0.020, 0.055);
+    slide.add(ejector);
+    // 套筒上的防滑纹底部倒角条（套筒与底把之间的接缝）
+    const seam = new THREE.Mesh(new THREE.BoxGeometry(0.157, 0.006, 0.44), DARK);
+    seam.position.set(0, 0.002, 0);
+    slide.add(seam);
+
+    // 底把（磷化钢）
+    const frame = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.1, 0.3), FRAME);
+    frame.position.set(0, -0.015, -0.02);
+    // 底把上的防滑纹（一侧有防滑槽）—— 同样只外凸 1mm
+    for (let i = 0; i < 5; i++) {
+      const ser = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.075, 0.014), DARK);
+      ser.position.set(0.0525, -0.015, -0.13 + i * 0.024);
+      frame.add(ser);
+    }
+    // 枪管 + 枪口冠 + 复进簧导杆
+    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 0.2, 12), BARREL);
+    barrel.rotation.x = Math.PI / 2; barrel.position.set(0, 0.055, -0.46);
+    const muzzle = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.03, 0.07, 12), STEEL);
+    muzzle.rotation.x = Math.PI / 2; muzzle.position.set(0, 0.055, -0.58);
+    // 复进簧导杆：原来长 0.17、中心在 z=-0.34，尾端戳出套筒前面 3.5cm 悬在空中。
+    // 缩短并整体挪回套筒内部。
+    const recoil = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.13, 8), STEEL);
+    recoil.rotation.x = Math.PI / 2; recoil.position.set(0, 0.105, -0.30);
+    // 扳机护圈 + 扳机 + 扳机保险片
+    // 原来用 TorusGeometry：three.js 的圆环默认躺在 **XY 平面**（正对枪口），
+    // 而扳机护圈是手指从**侧面**（X 方向）伸进去的环，应该躺在 **YZ 平面**。
+    // 直接改用三段方料（前立柱 + 底梁 + 后立柱），位置和连接关系都可控。
+    const guardFront = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.075, 0.016), FRAME);
+    guardFront.position.set(0, -0.085, -0.135);
+    const guardBottom = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.016, 0.105), FRAME);
+    guardBottom.position.set(0, -0.128, -0.088);
+    const guardBack = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.075, 0.016), FRAME);
+    guardBack.position.set(0, -0.085, -0.04);
+    const trigger = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.05, 0.016), STEEL);
+    trigger.position.set(0, -0.07, -0.09); trigger.rotation.x = 0.3;
+    const trigSafe = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.02, 0.012), STEEL);
+    trigSafe.position.set(0, -0.058, -0.086);
+    // 握把（聚合物颗粒纹）—— 主体 + 背板 + 前板 + 弹匣井，做出人体工学弧度
+    // 重要：握把自身已经转了 0.30 rad，所有子物体会**继承**这个旋转。
+    // 子物体再写 rotation.x = 0.30 就会变成 0.60 rad（二次旋转），
+    // 板件和握把主体完全对不上，看起来就是"错位的贴图"。
+    // 所以子物体的 rotation 只写**相对差值**。
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.095, 0.235, 0.108), POLY);
+    grip.position.set(0, -0.175, 0.075); grip.rotation.x = 0.30;
+    // 背板（贴掌心的那一面，往后翘）—— 嵌进握把后表面，只露出 5mm
+    const backstrap = new THREE.Mesh(new THREE.BoxGeometry(0.097, 0.245, 0.022), POLY);
+    backstrap.position.set(0, 0.005, 0.048);
+    grip.add(backstrap);
+    // 前板（手指绕的那一面，往前翘更陡）—— 相对握把多 8°，不是再加 0.38
+    const frontstrap = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.225, 0.02), POLY);
+    frontstrap.position.set(0, 0.008, -0.048);
+    frontstrap.rotation.x = 0.08;
+    grip.add(frontstrap);
+    // 弹匣井（握把底部的加厚部分）—— 与握把平行，不再二次旋转
+    const magwell = new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.05, 0.115), POLY);
+    magwell.position.set(0, -0.100, 0.0);
+    grip.add(magwell);
+    // 扳机护圈下方的让位槽（真实枪上手指要能伸进去）
+    const undercut = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.035, 0.05), DARK);
+    undercut.position.set(0, 0.095, -0.035);
+    grip.add(undercut);
+    // 握把**前侧**的手指槽（3 道）—— 之前错放在背面（z = +0.04），
+    // 而且跟着握把又转了一次 0.30，肉眼看去是几块歪掉的板。
+    for (let i = 0; i < 3; i++) {
+      const slot = new THREE.Mesh(new THREE.BoxGeometry(0.096, 0.012, 0.016), DARK);
+      slot.position.set(0, 0.05 - i * 0.048, -0.05);
+      grip.add(slot);
+    }
+    // 弹匣（黑色氧化钢）—— 只从握把底部露出约 3cm
+    const mag = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.16, 0.115), DARK);
+    mag.position.set(0, -0.245, 0.095); mag.rotation.x = 0.24;
+    // 弹匣底板 —— 做成弹匣的**子物体**，自动继承 0.24 rad 的倾角，
+    // 不会再出现"底板自己又转 0.24 → 0.48"导致与弹匣脱节。
+    const magBase = new THREE.Mesh(new THREE.BoxGeometry(0.095, 0.018, 0.125), STEEL);
+    magBase.position.set(0, -0.087, 0.009);
+    mag.add(magBase);
+    // 弹匣正面的见证孔（观察窗）—— 贴在弹匣前表面，之前用了枪械坐标，飘在弹匣下方 32cm
+    const witness = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.04, 0.012), DARK);
+    witness.position.set(0, -0.01, -0.056);
+    mag.add(witness);
+    // 弹匣底板上的防滑纹
+    for (let i = 0; i < 4; i++) {
+      const r = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.006, 0.008), DARK);
+      r.position.set(0, -0.011, -0.04 + i * 0.026);
+      magBase.add(r);
+    }
+    // 准星（带橙色点）+ 照门（双翼）+ 准星护圈
+    const sightF = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.035, 0.014), STEEL);
+    sightF.position.set(0, 0.145, -0.36);
+    const sightDot = new THREE.Mesh(new THREE.CircleGeometry(0.005, 8),
+      new THREE.MeshBasicMaterial({ color: 0xff6b3d, toneMapped: false }));
+    sightDot.position.set(0, 0.145, -0.368);
+    sightDot.rotation.y = Math.PI;
+    const sightR = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.03, 0.016), STEEL);
+    sightR.position.set(0, 0.14, 0.03);
+    // 照门缺口：作为 sightR 的子物体要用**局部**坐标。
+    // 之前写的是 (0, 0.138, 0.03)（枪械坐标），于是这块黑片飞到了照门上方 11cm。
+    const notch = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.024, 0.018), DARK);
+    notch.position.set(0, 0.004, 0);
+    sightR.add(notch);
+    // 底把前端的防尘盖（连接底把与套筒）
+    // 原来的"导轨"长 0.28、中心在 z=-0.30，而底把只到 z=-0.17 ——
+    // 整条导轨悬在枪口下方的空气里。这里改成从底把前端伸出、抵住套筒的防尘盖。
+    const rail = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.03, 0.22), DARK);
+    rail.position.set(0, -0.005, -0.23);
+    // 底把螺丝（只外凸 1mm）
+    for (const s of [1, -1]) {
+      const sc = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.01, 6), STEEL);
+      sc.rotation.z = Math.PI / 2;
+      sc.position.set(s * 0.0535, 0.005, 0.02);
+      frame.add(sc);
+    }
+    // 套筒释放钮 + 弹匣卡笋 + 空仓挂机
+    const slideStop = new THREE.Mesh(new THREE.BoxGeometry(0.01, 0.026, 0.05), STEEL);
+    slideStop.position.set(-0.0745, 0.0, 0.02);
+    slide.add(slideStop);
+    const magRel = new THREE.Mesh(new THREE.BoxGeometry(0.012, 0.028, 0.036), STEEL);
+    magRel.position.set(-0.0525, -0.045, 0.02);
+    frame.add(magRel);
+    // 能量电池（发光球）—— 原来半径 0.045、中心 x=0.07，整颗球有 3.7cm 悬在枪外
+    const cell = new THREE.Mesh(new THREE.SphereGeometry(0.026, 12, 10),
+      new THREE.MeshBasicMaterial({ color: 0x35e6ff, toneMapped: false }));
+    cell.position.set(0.055, 0.02, -0.02);
+
+    [slide, slideTop, frame, barrel, muzzle, recoil, guardFront, guardBottom, guardBack,
+     trigger, trigSafe, grip, mag, sightF, sightDot, sightR, rail, cell]
+      .forEach(m => g.add(m));
+    g.userData.cells = [cell];
+    // 套筒激光刻字（两侧，文字顺着套筒长度方向排布）
+    g.add(makeMarking(0.27, 0.048, 0.0785, 0.058, -0.20, [
+      { text: 'NEON STRIKE', size: 44 },
+      { text: '9×19 · P-9', size: 28, gap: 1.15 }
+    ], 1));
+    g.add(makeMarking(0.27, 0.048, -0.0785, 0.058, -0.20, [
+      { text: 'NEON STRIKE', size: 44 },
+      { text: '9×19 · P-9', size: 28, gap: 1.15 }
+    ], -1));
+  }
+
+  const glow = addGlow(g, 0x35e6ff, kind === 'gatling' ? 0.85 : 0.6, 0.45);
+  glow.position.set(0, 0, kind === 'gatling' ? -0.35 : -0.2);
+  g.userData.glow = glow;
+
+  // 枪口闪光（Sprite，贴在枪口）
+  const flash = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: glowTex, color: 0xffe9a8, blending: THREE.AdditiveBlending,
+    transparent: true, depthWrite: false, depthTest: false, opacity: 0, toneMapped: false
+  }));
+  flash.scale.set(flashScale, flashScale, 1);
+  flash.position.set(flashPos[0], flashPos[1], flashPos[2]);
+  g.add(flash);
+  g.userData.flash = flash;
+
+  g.position.set(0.26, -0.23, -0.5);
+  g.rotation.set(0, 0, 0);
+  // 视图模型放到图层 1：只接受相机随身补光的照射
+  g.traverse(o => o.layers.enable(1));
+  camera.add(g);
+  return g;
+}
+
+/** 激光刻字贴花：贴在零件侧面的一层薄面片 */
+/** 侧面激光刻字贴花。
+ *  PlaneGeometry 的文字纹理是画在平面**局部 X 轴**上的，而枪械的长轴是 **Z 轴**。
+ *  所以贴花必须绕 Y 转 90°，让法线指向 ±X（机匣侧面）、文字顺着枪管排布。
+ *  早先直接用 rotation.y = 0 会有两个后果：
+ *    1. 文字横跨枪身（"横过来的文字"）；
+ *    2. 贴花宽度 0.26~0.30 m 远大于枪身宽度 0.15~0.20 m，整块贴花从侧面戳出来。
+ *  side: +1 = 右侧（法线 +X），-1 = 左侧（法线 -X）。两面都用同一个绕向，
+ *  从各自一侧看过去文字都是正的。 */
+function makeMarking(w, h, x, y, z, lines, side) {
+  const maps = makeMarkingMaps(Math.round(w * 700), Math.round(h * 700), lines);
+  const mat = new THREE.MeshStandardMaterial({
+    map: maps.map, normalMap: maps.normalMap,
+    transparent: true, depthWrite: false,
+    metalness: 0.85, roughness: 0.34, envMapIntensity: 1.1,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), mat);
+  m.position.set(x, y, z);
+  m.rotation.y = side > 0 ? Math.PI / 2 : -Math.PI / 2;
+  m.renderOrder = 3;
+  return m;
+}
+
+/** 切换武器 */
+function setWeapon(i) {
+  const idx = ((i % WEAPONS.length) + WEAPONS.length) % WEAPONS.length;
+  if (idx === player.weapon && gunViews[idx]) return;
+  player.weapon = idx;
+  const w = WEAPONS[idx];
+  player.mag = w.mag; player.magSize = w.mag;
+  player.reloadT = 0; player.fireCd = 0.18; player.spreadHeat = 0;
+  gunViews.forEach((v, k) => { if (v) v.visible = k === idx; });
+  gun = gunViews[idx];
+  muzzleFlash = gun.userData.flash;
+  tone(520, 0.06, 'square', 0.03);
+  tone(780, 0.05, 'square', 0.025, 0, 0.05);
+}
+
+/* ============================================================
+   程序化 PBR 贴图工厂 —— 全部用 canvas 生成，不依赖任何图片文件
+   每种材质输出 albedo / normal / roughness 三张贴图
+   ============================================================ */
+function hash2(x, y, s) {
+  let n = (x * 1619 + y * 31337 + s * 6971) | 0;
+  n = (n << 13) ^ n;
+  return 1.0 - ((n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741824.0;
+}
+function vnoise(x, y, s) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi, s), b = hash2(xi + 1, yi, s);
+  const c = hash2(xi, yi + 1, s), d = hash2(xi + 1, yi + 1, s);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+function fbm(x, y, s, oct = 4) {
+  let v = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) { v += amp * vnoise(x * f, y * f, s + i * 17); norm += amp; f *= 2; amp *= 0.5; }
+  return v / norm;
+}
+/** 高度场 → 法线贴图 */
+function heightToNormal(height, size, strength) {
+  const c = document.createElement('canvas'); c.width = c.height = size;
+  const g = c.getContext('2d');
+  const img = g.createImageData(size, size);
+  const at = (x, y) => height[((y + size) % size) * size + ((x + size) % size)];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const nx = (at(x - 1, y) - at(x + 1, y)) * strength;
+      const ny = (at(x, y - 1) - at(x, y + 1)) * strength;
+      const len = Math.hypot(nx, ny, 1);
+      const o = (y * size + x) * 4;
+      img.data[o]     = ((nx / len) * 0.5 + 0.5) * 255;
+      img.data[o + 1] = ((ny / len) * 0.5 + 0.5) * 255;
+      img.data[o + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      img.data[o + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return c;
+}
+/** 非正方形版本（车削件贴图：圆周 256 × 轴向 512） */
+function heightToNormalRect(height, w, h, strength) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  const img = g.createImageData(w, h);
+  const at = (x, y) => height[((y + h) % h) * w + ((x + w) % w)];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const nx = (at(x - 1, y) - at(x + 1, y)) * strength;
+      const ny = (at(x, y - 1) - at(x, y + 1)) * strength;
+      const len = Math.hypot(nx, ny, 1);
+      const o = (y * w + x) * 4;
+      img.data[o]     = ((nx / len) * 0.5 + 0.5) * 255;
+      img.data[o + 1] = ((ny / len) * 0.5 + 0.5) * 255;
+      img.data[o + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      img.data[o + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return c;
+}
+function canvasToNormalRect(src, strength) {
+  const w = src.width, h = src.height;
+  const d = src.getContext('2d').getImageData(0, 0, w, h).data;
+  const hh = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) hh[i] = d[i * 4] / 255;
+  return heightToNormalRect(hh, w, h, strength);
+}
+/** 生成一套材质贴图 */
+function makeSurfaceMaps(cfg) {
+  const size = cfg.size || 256;
+  const base = cfg.base, type = cfg.type, seed = cfg.seed || 1;
+  const rough0 = cfg.rough ?? 0.7;
+  const height = new Float32Array(size * size);
+
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const ac = alb.getContext('2d');
+  const aimg = ac.createImageData(size, size);
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const rc = rgh.getContext('2d');
+  const rimg = rc.createImageData(size, size);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = y * size + x, o = i * 4;
+      const u = x / size, v = y / size;
+      let h = 0, shade = 1, rough = rough0;
+      if (type === 'skin') {
+        const n1 = fbm(u * 22, v * 22, seed, 4);
+        const pores = fbm(u * 110, v * 110, seed + 5, 2);
+        h = n1 * 0.45 + pores * 0.55;
+        shade = 1 + n1 * 0.10 + pores * 0.06;
+        rough = rough0 + pores * 0.14;
+      } else if (type === 'fabric') {
+        const weave = Math.sin(u * size * 0.82) * Math.sin(v * size * 0.82) * 0.5;
+        const fuzz = fbm(u * 48, v * 48, seed, 3);
+        h = weave * 0.62 + fuzz * 0.38;
+        shade = 1 + weave * 0.11 + fuzz * 0.09;
+        rough = rough0 + fuzz * 0.07;
+      } else if (type === 'metal') {
+        const brush = fbm(u * 3.5, v * 110, seed, 3);     // 拉丝纹
+        const pit = fbm(u * 20, v * 20, seed + 9, 3);
+        h = brush * 0.82 + pit * 0.18;
+        shade = 1 + brush * 0.15 + pit * 0.06;
+        rough = rough0 + Math.abs(brush) * 0.18;
+      } else if (type === 'polymer') {
+        const stip = Math.sin(u * size * 1.7) * Math.sin(v * size * 1.7) * 0.5;
+        const fine = fbm(u * 70, v * 70, seed, 2);
+        h = stip * 0.68 + fine * 0.32;
+        shade = 1 + stip * 0.08 + fine * 0.06;
+        rough = rough0 + fine * 0.09;
+      } else if (type === 'hair') {
+        const strand = fbm(u * 6, v * 150, seed, 3);
+        h = strand;
+        shade = 1 + strand * 0.2;
+        rough = rough0 + strand * 0.1;
+      } else if (type === 'scales') {
+        // 鳞甲：错排的鳞板 + 鳞板之间的沟缝（缝更暗、更粗糙）
+        const N = cfg.cells || 14;
+        const row = Math.floor(v * N / 1.4);
+        const off = (row % 2) * 0.5;
+        const fx = (u * N + off) % 1;
+        const fy = (v * N / 1.4) % 1;
+        const edge = Math.min(fx, 1 - fx, fy, 1 - fy);
+        const plate = Math.cos(clamp(edge, 0, 0.5) * Math.PI * 2) * 0.5 + 0.5;
+        const grit = fbm(u * 90, v * 90, seed, 2);
+        const crack = fbm(u * 9, v * 9, seed + 13, 3);
+        h = plate * 0.72 + grit * 0.22 - crack * 0.06;
+        shade = 0.74 + plate * 0.34 + grit * 0.08;
+        rough = rough0 + (1 - plate) * 0.22 + grit * 0.06;
+      }
+      height[i] = h;
+      aimg.data[o]     = clamp(base[0] * shade, 0, 255);
+      aimg.data[o + 1] = clamp(base[1] * shade, 0, 255);
+      aimg.data[o + 2] = clamp(base[2] * shade, 0, 255);
+      aimg.data[o + 3] = 255;
+      const ro = clamp(rough * 255, 0, 255);
+      rimg.data[o] = ro; rimg.data[o + 1] = ro; rimg.data[o + 2] = ro; rimg.data[o + 3] = 255;
+    }
+  }
+  ac.putImageData(aimg, 0, 0);
+  rc.putImageData(rimg, 0, 0);
+
+  const map = new THREE.CanvasTexture(alb);
+  map.colorSpace = THREE.SRGBColorSpace;
+  const normalMap = new THREE.CanvasTexture(heightToNormal(height, size, cfg.bump ?? 2.2));
+  const roughnessMap = new THREE.CanvasTexture(rgh);
+  const rep = cfg.repeat || 1;
+  for (const t of [map, normalMap, roughnessMap]) {
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(rep, rep);
+    t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  }
+  return { map, normalMap, roughnessMap };
+}
+
+/* ============================================================
+   场景贴图 —— 大幅 canvas 绘制（污渍 / 裂缝 / 锈迹 / 磨损）
+   ============================================================ */
+function seeded(seed) {
+  let s = seed >>> 0;
+  return () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+}
+/** 灰度画布 → 法线贴图（用红通道当高度） */
+function canvasToNormal(src, strength) {
+  const size = src.width;
+  const d = src.getContext('2d').getImageData(0, 0, size, size).data;
+  const h = new Float32Array(size * size);
+  for (let i = 0; i < size * size; i++) h[i] = d[i * 4] / 255;
+  return heightToNormal(h, size, strength);
+}
+function tex(c, srgb, repeat = 1) {
+  const t = new THREE.CanvasTexture(c);
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(repeat, repeat);
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return t;
+}
+
+/** 混凝土地面：大面积不重复纹理，含骨料、污渍、裂缝、磨损标线、水洼、排水格栅 */
+function makeFloorMaps(size = 1024) {
+  const R = seeded(20240917);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+
+  A.fillStyle = '#4d525b'; A.fillRect(0, 0, size, size);
+  H.fillStyle = '#808080'; H.fillRect(0, 0, size, size);
+  G.fillStyle = '#dcdcdc'; G.fillRect(0, 0, size, size);
+
+  // 骨料颗粒
+  for (let i = 0; i < 24000; i++) {
+    const x = R() * size, y = R() * size, r = 0.6 + R() * 2.2, v = R();
+    const light = v > 0.55;
+    A.fillStyle = light ? `rgba(214,218,226,${0.06 + R() * 0.18})` : `rgba(48,52,62,${0.07 + R() * 0.2})`;
+    A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+    const hv = 128 + (v - 0.5) * 80;
+    H.fillStyle = `rgb(${hv | 0},${hv | 0},${hv | 0})`;
+    H.beginPath(); H.arc(x, y, r, 0, 7); H.fill();
+  }
+  // 大块污渍 / 潮痕
+  for (let i = 0; i < 90; i++) {
+    const x = R() * size, y = R() * size, r = 30 + R() * 190;
+    const grd = A.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, R() > 0.45 ? 'rgba(26,30,38,0.34)' : 'rgba(158,164,176,0.16)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    A.fillStyle = grd; A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+  }
+  // 油污
+  for (let i = 0; i < 14; i++) {
+    const x = R() * size, y = R() * size, r = 18 + R() * 60;
+    const grd = A.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, 'rgba(16,15,13,0.55)'); grd.addColorStop(1, 'rgba(3,4,7,0)');
+    A.fillStyle = grd; A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+    const gg = G.createRadialGradient(x, y, 0, x, y, r);
+    gg.addColorStop(0, 'rgba(40,40,40,0.9)'); gg.addColorStop(1, 'rgba(220,220,220,0)');
+    G.fillStyle = gg; G.beginPath(); G.arc(x, y, r, 0, 7); G.fill();
+  }
+  // 裂缝（凹陷）
+  for (let i = 0; i < 16; i++) {
+    let x = R() * size, y = R() * size, ang = R() * Math.PI * 2;
+    const seg = 5 + Math.floor(R() * 9);
+    A.strokeStyle = 'rgba(14,16,20,0.82)'; A.lineWidth = 0.8 + R() * 2.4;
+    H.strokeStyle = 'rgba(38,38,38,0.95)'; H.lineWidth = A.lineWidth;
+    A.beginPath(); H.beginPath(); A.moveTo(x, y); H.moveTo(x, y);
+    for (let s = 0; s < seg; s++) {
+      ang += (R() - 0.5) * 1.15;
+      const len = 12 + R() * 46;
+      x += Math.cos(ang) * len; y += Math.sin(ang) * len;
+      A.lineTo(x, y); H.lineTo(x, y);
+    }
+    A.stroke(); H.stroke();
+  }
+  // 磨损的地面标线
+  const paint = document.createElement('canvas'); paint.width = paint.height = size;
+  const P = paint.getContext('2d');
+  P.strokeStyle = 'rgba(198,158,44,0.88)'; P.lineWidth = 15;
+  P.beginPath(); P.moveTo(size * 0.19, 0); P.lineTo(size * 0.19, size); P.stroke();
+  P.beginPath(); P.moveTo(size * 0.81, 0); P.lineTo(size * 0.81, size); P.stroke();
+  P.strokeStyle = 'rgba(196,202,212,0.55)'; P.lineWidth = 10;
+  for (let y = 0; y < size; y += 108) { P.beginPath(); P.moveTo(size * 0.5, y); P.lineTo(size * 0.5, y + 56); P.stroke(); }
+  P.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < 5200; i++) {
+    const x = R() * size, y = R() * size, r = 1 + R() * 7;
+    P.fillStyle = `rgba(0,0,0,${0.25 + R() * 0.7})`;
+    P.beginPath(); P.arc(x, y, r, 0, 7); P.fill();
+  }
+  P.globalCompositeOperation = 'source-over';
+  A.drawImage(paint, 0, 0);
+  H.globalAlpha = 0.55; H.drawImage(paint, 0, 0); H.globalAlpha = 1;
+  G.globalAlpha = 0.6; G.drawImage(paint, 0, 0); G.globalAlpha = 1;
+  // 水洼：albedo 变暗 + 粗糙度骤降（会反射霓虹）
+  for (let i = 0; i < 16; i++) {
+    const x = R() * size, y = R() * size, r = 40 + R() * 120;
+    const ga = A.createRadialGradient(x, y, 0, x, y, r);
+    ga.addColorStop(0, 'rgba(16,19,26,0.42)'); ga.addColorStop(0.75, 'rgba(24,28,36,0.2)'); ga.addColorStop(1, 'rgba(0,0,0,0)');
+    A.fillStyle = ga; A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+    const gg = G.createRadialGradient(x, y, 0, x, y, r);
+    gg.addColorStop(0, 'rgba(26,26,26,0.95)'); gg.addColorStop(0.7, 'rgba(70,70,70,0.55)'); gg.addColorStop(1, 'rgba(220,220,220,0)');
+    G.fillStyle = gg; G.beginPath(); G.arc(x, y, r, 0, 7); G.fill();
+  }
+  // 中央排水格栅
+  const dx = size * 0.5, dy = size * 0.5, dr = size * 0.105;
+  const gg2 = A.createRadialGradient(dx, dy, dr * 0.2, dx, dy, dr);
+  gg2.addColorStop(0, '#08090d'); gg2.addColorStop(1, '#272c34');
+  A.fillStyle = gg2; A.beginPath(); A.arc(dx, dy, dr, 0, 7); A.fill();
+  A.strokeStyle = 'rgba(118,126,138,0.5)'; A.lineWidth = 2;
+  for (let i = 0; i < 9; i++) {
+    const yy = dy - dr * 0.82 + i * (dr * 1.64 / 8);
+    A.beginPath(); A.moveTo(dx - dr * 0.82, yy); A.lineTo(dx + dr * 0.82, yy); A.stroke();
+  }
+  H.fillStyle = 'rgba(28,28,28,0.9)'; H.beginPath(); H.arc(dx, dy, dr, 0, 7); H.fill();
+  G.fillStyle = 'rgba(110,110,110,0.92)'; G.beginPath(); G.arc(dx, dy, dr, 0, 7); G.fill();
+
+  return {
+    map: tex(alb, true), normalMap: tex(canvasToNormal(hgt, 2.6), false),
+    roughnessMap: tex(rgh, false)
+  };
+}
+
+/** 金属墙板：压筋 + 铆钉 + 划痕 + 锈迹流痕 */
+function makePanelMaps(size = 512) {
+  const R = seeded(773311);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+  A.fillStyle = '#454c59'; A.fillRect(0, 0, size, size);
+  H.fillStyle = '#8a8a8a'; H.fillRect(0, 0, size, size);
+  G.fillStyle = '#b4b4b4'; G.fillRect(0, 0, size, size);
+  // 底材噪声
+  for (let i = 0; i < 9000; i++) {
+    const x = R() * size, y = R() * size, v = R();
+    A.fillStyle = `rgba(${v > 0.5 ? 186 : 44},${v > 0.5 ? 194 : 50},${v > 0.5 ? 208 : 62},${0.05 + R() * 0.12})`;
+    A.fillRect(x, y, 1 + R() * 2, 1 + R() * 2);
+  }
+  // 横向压筋（每 1/4 一道）+ 竖向拼缝
+  const seam = (x0, y0, x1, y1) => {
+    A.strokeStyle = 'rgba(8,10,14,0.75)'; A.lineWidth = 3;
+    H.strokeStyle = 'rgba(40,40,40,0.9)'; H.lineWidth = 3;
+    A.beginPath(); A.moveTo(x0, y0); A.lineTo(x1, y1); A.stroke();
+    H.beginPath(); H.moveTo(x0, y0); H.lineTo(x1, y1); H.stroke();
+    A.strokeStyle = 'rgba(160,168,182,0.22)'; A.lineWidth = 1;
+    A.beginPath(); A.moveTo(x0 + 2, y0 + 2); A.lineTo(x1 + 2, y1 + 2); A.stroke();
+  };
+  for (let i = 1; i < 4; i++) seam(0, (size / 4) * i, size, (size / 4) * i);
+  seam(size * 0.5, 0, size * 0.5, size);
+  // 铆钉
+  const rivet = (x, y) => {
+    const g = A.createRadialGradient(x - 1, y - 1, 0, x, y, 4);
+    g.addColorStop(0, 'rgba(186,194,208,0.75)'); g.addColorStop(1, 'rgba(20,24,32,0.6)');
+    A.fillStyle = g; A.beginPath(); A.arc(x, y, 3.6, 0, 7); A.fill();
+    H.fillStyle = 'rgba(225,225,225,0.9)'; H.beginPath(); H.arc(x, y, 3.4, 0, 7); H.fill();
+  };
+  for (let i = 0; i < 4; i++) {
+    const y = (size / 4) * i + 9;
+    for (let x = 14; x < size; x += 42) rivet(x, y);
+  }
+  for (let x = size * 0.5 - 9; x > 0; x -= 42) rivet(x, 9);
+  // 划痕
+  for (let i = 0; i < 60; i++) {
+    const x = R() * size, y = R() * size, len = 6 + R() * 70, a = (R() - 0.5) * 0.7 + (R() > 0.5 ? 0 : Math.PI / 2);
+    A.strokeStyle = `rgba(178,186,200,${0.05 + R() * 0.16})`; A.lineWidth = R() * 1.4 + 0.3;
+    A.beginPath(); A.moveTo(x, y); A.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len); A.stroke();
+  }
+  // 锈迹 / 污渍流痕（从上往下）
+  for (let i = 0; i < 26; i++) {
+    const x = R() * size, y = R() * size * 0.5, w = 3 + R() * 16, h = 40 + R() * 240;
+    const grd = A.createLinearGradient(x, y, x, y + h);
+    const rust = R() > 0.55;
+    grd.addColorStop(0, rust ? 'rgba(96,52,26,0.42)' : 'rgba(10,12,16,0.44)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    A.fillStyle = grd; A.fillRect(x, y, w, h);
+    G.fillStyle = rust ? 'rgba(225,225,225,0.5)' : 'rgba(240,240,240,0.4)';
+    G.fillRect(x, y, w, h);
+  }
+  return {
+    map: tex(alb, true), normalMap: tex(canvasToNormal(hgt, 2.0), false),
+    roughnessMap: tex(rgh, false)
+  };
+}
+
+/** 掩体柱：金属 + 底部黄黑警示条（BoxGeometry 的 v 轴对应高度） */
+function makePillarMaps(size = 512) {
+  const R = seeded(5150);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+  A.fillStyle = '#4b5361'; A.fillRect(0, 0, size, size);
+  H.fillStyle = '#8a8a8a'; H.fillRect(0, 0, size, size);
+  G.fillStyle = '#c0c0c0'; G.fillRect(0, 0, size, size);
+  for (let i = 0; i < 8000; i++) {
+    const x = R() * size, y = R() * size, v = R();
+    A.fillStyle = `rgba(${v > 0.5 ? 182 : 52},${v > 0.5 ? 190 : 58},${v > 0.5 ? 204 : 70},${0.05 + R() * 0.14})`;
+    A.fillRect(x, y, 1 + R() * 2, 1 + R() * 2);
+  }
+  // 警示条带（底部 26%）
+  const bandH = size * 0.26, bandY = size - bandH;
+  A.save(); A.beginPath(); A.rect(0, bandY, size, bandH); A.clip();
+  A.fillStyle = '#33394a'; A.fillRect(0, 0, size, bandH);
+  A.fillStyle = '#d4ae31';
+  for (let x = -bandH; x < size + bandH; x += 64) {
+    A.beginPath();
+    A.moveTo(x, bandY + bandH); A.lineTo(x + 32, bandY);
+    A.lineTo(x + 64, bandY); A.lineTo(x + 32, bandY + bandH);
+    A.closePath(); A.fill();
+  }
+  // 条带磨损
+  for (let i = 0; i < 1400; i++) {
+    const x = R() * size, y = bandY + R() * bandH;
+    A.fillStyle = `rgba(72,78,90,${0.1 + R() * 0.5})`;
+    A.beginPath(); A.arc(x, y, 1 + R() * 6, 0, 7); A.fill();
+  }
+  A.restore();
+  H.fillStyle = 'rgba(120,120,120,0.55)'; H.fillRect(0, bandY, size, bandH);
+  G.fillStyle = 'rgba(150,150,150,0.6)'; G.fillRect(0, bandY, size, bandH);
+  // 面板分割线
+  A.strokeStyle = 'rgba(8,10,14,0.7)'; A.lineWidth = 3;
+  A.beginPath(); A.moveTo(0, size * 0.42); A.lineTo(size, size * 0.42); A.stroke();
+  H.strokeStyle = 'rgba(40,40,40,0.9)'; H.lineWidth = 3;
+  H.beginPath(); H.moveTo(0, size * 0.42); H.lineTo(size, size * 0.42); H.stroke();
+  // 铆钉 + 划痕
+  for (let i = 0; i < 700; i++) {
+    const x = R() * size, y = R() * size, v = R();
+    A.fillStyle = `rgba(${v > 0.5 ? 168 : 30},${v > 0.5 ? 176 : 34},${v > 0.5 ? 190 : 42},${0.05 + R() * 0.12})`;
+    A.fillRect(x, y, 1 + R() * 3, 1 + R() * 2);
+  }
+  return {
+    map: tex(alb, true), normalMap: tex(canvasToNormal(hgt, 2.2), false),
+    roughnessMap: tex(rgh, false)
+  };
+}
+
+/* ============================================================
+   枪械贴图 —— 分表面处理（发蓝 / 磷化 / 不锈钢）+ 边缘磨损 + 刻字
+   真实感的关键点：
+   1. 边缘磨损：BoxGeometry 每个面的 UV 恰好是 0..1，所以贴图的边框
+      就等于几何体的棱角 —— 在边框画一圈磨白，立刻有"用旧了的枪"的味道
+   2. 表面处理必须斑驳：发蓝钢会褪成灰白斑，磷化层厚薄不均
+   3. 机加工刀纹：细密平行的车削痕迹（不是拉丝噪点）
+   4. 凹角积油泥 + 随机划痕，粗糙度反向对应（磨白处更亮更滑）
+   ============================================================ */
+const GUN_FINISH = {
+  //            基础色         磨白色          金属度
+  blued:     { base: [54, 59, 76], wear: [176, 184, 198], metal: 0.86 },
+  phosphate: { base: [76, 78, 84], wear: [154, 156, 160], metal: 0.74 },
+  stainless: { base: [146, 150, 158], wear: [212, 216, 222], metal: 0.95 },
+  black:     { base: [48, 49, 56], wear: [134, 138, 146], metal: 0.80 }
+};
+/** 哈希细噪：给金属表面加"微观颗粒"。
+ *  这是让程序化贴图从"平滑渐变"变成"照片"的关键一层 —— 真实金属
+ *  在任何尺度上都有像素级的明暗抖动，纯 fbm 只会得到塑料一样的曲面。 */
+function hashNoise(x, y, s) {
+  let h = (x * 374761393 + y * 668265263 + s * 2246822519) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+function makeGunMetalMaps(opts = {}) {
+  const size = opts.size || 512;
+  const seed = opts.seed || 7;
+  const F = GUN_FINISH[opts.finish || 'blued'];
+  const R = seeded(seed * 7919 + 13);
+  const wearW = size * 0.055;              // 边缘磨损带宽度
+  const lighten = opts.lighten || 1;       // 整体提亮（被磨得更亮的部件）
+  const dust = opts.dust || 0;             // 表面积灰比例（0~1）
+
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+  const img = A.createImageData(size, size);
+  const him = H.createImageData(size, size);
+  const rim = G.createImageData(size, size);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const u = x / size, v = y / size;
+
+      // 大尺度斑驳：表面处理不均匀（发蓝褪色 / 磷化厚薄）
+      const mottle = fbm(u * 5.5, v * 5.5, seed, 4);
+      // 机加工刀纹：极细的横向平行线
+      const brush = fbm(u * 2.4, v * 165, seed + 11, 2);
+      // 麻点 / 微观凹凸
+      const pit = fbm(u * 26, v * 26, seed + 29, 3);
+      // 车削纹（规则的细线，区别于随机噪点）
+      const turn = Math.sin(v * size * 2.35 + brush * 2.0) * 0.5 + 0.5;
+      // 微观颗粒：像素级白噪 + 稍粗一级的颗粒
+      const grain = hashNoise(x, y, seed);
+      const grain2 = hashNoise(x >> 1, y >> 1, seed + 5);
+      // 油泥 / 手汗斑：低频暖色污渍
+      const patina = fbm(u * 3.2, v * 3.2, seed + 61, 4);
+      // 热变色 / 氧化：更慢的色偏
+      const heat = fbm(u * 1.7, v * 1.7, seed + 97, 3);
+      // 油膜干涉（薄膜彩虹）：枪械表面残留油膜时出现的彩色反光，真实感很强
+      const film = fbm(u * 2.4 + 3.1, v * 2.4 - 1.7, seed + 131, 3);
+      const filmAmt = Math.max(0, film - 0.60) * 2.4;
+
+      // —— 边缘磨损 ——
+      const dl = x, dr = size - 1 - x, dt = y, db = size - 1 - y;
+      const dist = Math.min(dl, dr, dt, db);
+      const p = (dist === dl || dist === dr) ? y : x;   // 沿边缘的坐标
+      const en = fbm(p / (size * 0.16), 4.3, seed + 37, 3);
+      let wear = 0;
+      if (dist < wearW && en > 0.40) {
+        wear = (1 - dist / wearW) * Math.min(1, (en - 0.40) / 0.26);
+      }
+      // 四角磨损更重（磕碰最容易发生的地方）
+      if (dl < wearW * 1.5 && dr < wearW * 1.5 && (dt < wearW * 2.2 || db < wearW * 2.2)) {
+        wear = Math.min(1, wear + 0.42 * en);
+      }
+
+      // —— 颜色合成 ——
+      // 基础明暗：斑驳 + 刀纹 + 麻点，再叠上像素级颗粒
+      const shade = 1
+        + (mottle - 0.5) * 0.46          // 大块表面处理不均
+        + (brush - 0.5) * 0.20           // 车削刀纹（明显的平行细线）
+        + (pit - 0.5) * 0.14             // 麻点凹陷
+        + (grain - 0.5) * 0.085          // 微观颗粒（照片感的关键）
+        + (grain2 - 0.5) * 0.05;
+      let r = F.base[0] * shade * lighten;
+      let g = F.base[1] * shade * lighten;
+      let b = F.base[2] * shade * lighten;
+      // 发蓝褪色 → 灰白斑
+      const fade = Math.max(0, mottle - 0.56) * 2.0;
+      r = lerp(r, 116, fade * 0.50); g = lerp(g, 120, fade * 0.50); b = lerp(b, 126, fade * 0.50);
+      // 油泥 / 手汗：暖褐色污渍，集中在低频斑块里
+      const pAmt = Math.max(0, patina - 0.50) * 2.1 * (1 - wear * 0.7);
+      r = lerp(r, 74, pAmt * 0.42); g = lerp(g, 58, pAmt * 0.42); b = lerp(b, 44, pAmt * 0.42);
+      // 热变色 / 氧化：偏紫蓝的色偏，只在极少区域出现
+      const hAmt = Math.max(0, heat - 0.66) * 2.6;
+      r = lerp(r, 88, hAmt * 0.34); g = lerp(g, 78, hAmt * 0.34); b = lerp(b, 104, hAmt * 0.34);
+      // 油膜干涉色：薄油膜在金属上产生的彩虹反光（品红 / 金 / 青）
+      if (filmAmt > 0) {
+        const hue = film * 6.2832;
+        const fr = 0.5 + 0.5 * Math.cos(hue);
+        const fg = 0.5 + 0.5 * Math.cos(hue - 2.094);
+        const fb = 0.5 + 0.5 * Math.cos(hue - 4.188);
+        r = lerp(r, 62 + fr * 128, filmAmt * 0.30);
+        g = lerp(g, 62 + fg * 116, filmAmt * 0.30);
+        b = lerp(b, 62 + fb * 136, filmAmt * 0.30);
+      }
+      // 深麻点：个别像素压暗，形成"氧化点"
+      const deep = Math.max(0, pit - 0.80) * 5.0;
+      r = lerp(r, 14, deep * 0.55); g = lerp(g, 14, deep * 0.55); b = lerp(b, 16, deep * 0.55);
+      // 边缘磨白
+      if (wear > 0) {
+        r = lerp(r, F.wear[0], wear * 0.90);
+        g = lerp(g, F.wear[1], wear * 0.90);
+        b = lerp(b, F.wear[2], wear * 0.90);
+      }
+      // 磨白边内侧的积垢暗带：真实金属边缘是"亮线 + 一圈发暗的积垢"成对出现
+      const grimeW = wearW * 1.9;
+      let gm = 0;
+      if (dist > wearW && dist < grimeW) {
+        gm = (1 - (dist - wearW) / (grimeW - wearW)) * (0.30 + en * 0.55);
+        r = lerp(r, 30, gm * 0.44); g = lerp(g, 27, gm * 0.44); b = lerp(b, 24, gm * 0.44);
+      }
+      // 表面积灰：浅灰褐的浮尘，落在平面（不是倒角）上
+      if (dust > 0) {
+        const dm = fbm(u * 9, v * 9, seed + 71, 3);
+        const dAmt = Math.max(0, dm - 0.52) * 1.9 * dust * (1 - wear * 0.6);
+        r = lerp(r, 150, dAmt * 0.60); g = lerp(g, 144, dAmt * 0.60); b = lerp(b, 130, dAmt * 0.60);
+      }
+      img.data[i] = clamp(r, 0, 255);
+      img.data[i + 1] = clamp(g, 0, 255);
+      img.data[i + 2] = clamp(b, 0, 255);
+      img.data[i + 3] = 255;
+
+      // —— 高度：刀纹 + 麻点 + 微观颗粒；磨白处被磨平 ——
+      const hv = 128
+        + (brush - 0.5) * 58        // 车削刀纹要够深，否则看不出加工感
+        + (pit - 0.5) * 30
+        + (turn - 0.5) * 14
+        + (grain - 0.5) * 26       // 微观起伏
+        + (grain2 - 0.5) * 16;
+      him.data[i] = him.data[i + 1] = him.data[i + 2] = clamp(lerp(hv, 146, wear * 0.55), 0, 255);
+      him.data[i + 3] = 255;
+
+      // —— 粗糙度：磨白处更光滑（更亮），污渍/积灰处更粗糙 ——
+      const rv = 148
+        + (mottle - 0.5) * 66
+        + (brush - 0.5) * 52
+        + (pit - 0.5) * 38
+        + (grain - 0.5) * 34       // 微观粗糙度抖动 → 高光碎成细密颗粒
+        + (grain2 - 0.5) * 20
+        - pAmt * 60               // 油泥处更亮（更粗糙）
+        - filmAmt * 52            // 油膜是滑的 → 高光更锐
+        + gm * 46;                // 边缘积垢更粗糙
+      const dm = dust > 0 ? Math.max(0, fbm(u * 9, v * 9, seed + 71, 3) - 0.52) * 1.9 * dust : 0;
+      rim.data[i] = rim.data[i + 1] = rim.data[i + 2] =
+        clamp(lerp(lerp(rv, 58, wear * 0.78), 232, dm * 0.7), 0, 255);
+      rim.data[i + 3] = 255;
+    }
+  }
+  A.putImageData(img, 0, 0); H.putImageData(him, 0, 0); G.putImageData(rim, 0, 0);
+
+  // ── 加工纹（显式画线）──────────────────────────────────────
+  // 前面那些 fbm 只是"低频色斑"，真正让金属看起来像加工件的是**成组的平行细线**。
+  // 噪声做不出这种有方向、有节距的纹理，必须一条条画。
+  // blued：发蓝钢是精磨过的 → 密集、极细的纵向磨痕
+  // phosphate：磷化是哑光带皱的 → 细密颗粒 + 短划痕
+  // stainless：拉丝不锈钢 → 长而连续的拉丝纹
+  const lineCount = opts.finish === 'stainless' ? 620 : opts.finish === 'phosphate' ? 380 : 520;
+  for (let i = 0; i < lineCount; i++) {
+    const vertical = R() < 0.72;                   // 大部分纵向（沿零件长轴）
+    const bright = R() < 0.45;
+    const a = 0.04 + R() * (opts.finish === 'phosphate' ? 0.16 : 0.24);
+    const lw = 0.4 + R() * (opts.finish === 'phosphate' ? 1.1 : 1.6);
+    const len = vertical ? size * (0.25 + R() * 0.8) : size * (0.3 + R() * 0.7);
+    const cx = R() * size, cy = R() * size;
+    const ang = vertical ? (R() - 0.5) * 0.06 : Math.PI / 2 + (R() - 0.5) * 0.08;
+    const ex = Math.cos(ang) * len, ey = Math.sin(ang) * len;
+    const stroke = (ctx, col, wid) => {
+      ctx.strokeStyle = col; ctx.lineWidth = wid;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + ex, cy + ey); ctx.stroke();
+    };
+    stroke(A, bright ? `rgba(222,228,240,${a})` : `rgba(16,17,21,${a})`, lw);
+    stroke(H, `rgba(${bright ? 198 : 66},${bright ? 198 : 66},${bright ? 198 : 66},${0.28 + R() * 0.34})`, lw * 0.9);
+    stroke(G, `rgba(${bright ? 44 : 208},${bright ? 44 : 208},${bright ? 44 : 208},0.42)`, lw + 0.4);
+  }
+  // 磷化/发黑件特有的**皱皮颗粒**（哑光表面特有的"橘皮"感）
+  if (opts.finish === 'phosphate' || opts.finish === 'black') {
+    for (let i = 0; i < 900; i++) {
+      const x = R() * size, y = R() * size, r = 0.8 + R() * 3.4;
+      const up = R() < 0.5;
+      A.fillStyle = up ? `rgba(200,206,218,${0.05 + R() * 0.11})` : `rgba(12,13,16,${0.06 + R() * 0.13})`;
+      A.beginPath(); A.ellipse(x, y, r, r * (0.5 + R() * 0.6), R() * 3, 0, 7); A.fill();
+      H.fillStyle = up ? `rgba(190,190,190,${0.3 + R() * 0.3})` : `rgba(78,78,78,${0.3 + R() * 0.3})`;
+      H.beginPath(); H.ellipse(x, y, r * 0.8, r * 0.6, 0, 0, 7); H.fill();
+      G.fillStyle = up ? 'rgba(196,196,196,0.32)' : 'rgba(210,210,210,0.3)';
+      G.beginPath(); G.ellipse(x, y, r * 0.8, r * 0.6, 0, 0, 7); G.fill();
+    }
+  }
+  // —— 深划痕（露出亮钢）—— 数量多、长度分档、亮度分档
+  for (let i = 0; i < 260; i++) {
+    const x = R() * size, y = R() * size;
+    const len = 6 + R() * R() * 190;              // 短划痕多、长划痕少
+    const a = (R() - 0.5) * 0.62;
+    const ex = Math.cos(a) * len, ey = Math.sin(a) * len;
+    const bright = R() < 0.62;
+    A.strokeStyle = bright
+      ? `rgba(226,232,242,${0.16 + R() * 0.38})`
+      : `rgba(8,9,11,${0.14 + R() * 0.30})`;
+    A.lineWidth = 0.35 + R() * 1.5;
+    A.beginPath(); A.moveTo(x, y); A.lineTo(x + ex, y + ey); A.stroke();
+    // 划痕两侧的暗边：真实划痕是"亮沟底 + 暗微倒角"，一条线看着像画上去的
+    const nx = -Math.sin(a) * (0.9 + R() * 0.9), ny = Math.cos(a) * (0.9 + R() * 0.9);
+    A.strokeStyle = `rgba(9,10,13,${0.10 + R() * 0.18})`;
+    A.lineWidth = 0.6 + R() * 0.6;
+    A.beginPath(); A.moveTo(x + nx, y + ny); A.lineTo(x + ex + nx, y + ey + ny); A.stroke();
+    // 划痕有沟槽 → 高度图压低
+    H.strokeStyle = `rgba(${bright ? 196 : 74},${bright ? 196 : 74},${bright ? 196 : 74},${0.34 + R() * 0.3})`;
+    H.lineWidth = 0.7 + R() * 0.9;
+    H.beginPath(); H.moveTo(x, y); H.lineTo(x + ex, y + ey); H.stroke();
+    // 划过的底面更光亮 → 粗糙度低
+    G.strokeStyle = `rgba(${bright ? 30 : 210},${bright ? 30 : 210},${bright ? 30 : 210},0.55)`;
+    G.lineWidth = 1.3;
+    G.beginPath(); G.moveTo(x, y); G.lineTo(x + ex, y + ey); G.stroke();
+  }
+  // —— 抛光旋纹（抛光的圆弧痕迹，像被反复摩挲过）——
+  for (let i = 0; i < 40; i++) {
+    const cx = R() * size, cy = R() * size, rad = 20 + R() * 130;
+    const a0 = R() * 6.28, a1 = a0 + 0.25 + R() * 1.5;
+    A.strokeStyle = `rgba(206,214,228,${0.05 + R() * 0.10})`;
+    A.lineWidth = 0.5 + R() * 1.6;
+    A.beginPath(); A.arc(cx, cy, rad, a0, a1); A.stroke();
+    G.strokeStyle = `rgba(60,60,60,${0.10 + R() * 0.16})`;
+    G.lineWidth = 1.2;
+    G.beginPath(); G.arc(cx, cy, rad, a0, a1); G.stroke();
+  }
+  // —— 崩口 / 掉漆斑（不规则小坑）——
+  for (let i = 0; i < 40; i++) {
+    const x = R() * size, y = R() * size, r = 1.5 + R() * 12;
+    A.fillStyle = `rgba(206,212,224,${0.16 + R() * 0.30})`;
+    A.beginPath(); A.ellipse(x, y, r, r * (0.35 + R() * 0.7), R() * 3, 0, 7); A.fill();
+    // 崩口边缘一圈更亮的毛刺
+    A.strokeStyle = `rgba(238,242,250,${0.10 + R() * 0.18})`; A.lineWidth = 0.8;
+    A.beginPath(); A.ellipse(x, y, r, r * 0.55, R() * 3, 0, 7); A.stroke();
+    H.fillStyle = 'rgba(88,88,88,0.62)';
+    H.beginPath(); H.ellipse(x, y, r * 0.8, r * 0.5, 0, 0, 7); H.fill();
+    G.fillStyle = 'rgba(46,46,46,0.55)';
+    G.beginPath(); G.ellipse(x, y, r * 0.8, r * 0.5, 0, 0, 7); G.fill();
+  }
+  // —— 油泥 / 积碳（在凹处堆积，粗糙度高）——
+  for (let i = 0; i < 30; i++) {
+    const x = R() * size, y = R() * size, r = 8 + R() * 52;
+    const grd = A.createRadialGradient(x, y, 0, x, y, r);
+    grd.addColorStop(0, 'rgba(10,9,8,0.52)'); grd.addColorStop(0.55, 'rgba(28,22,16,0.24)');
+    grd.addColorStop(1, 'rgba(0,0,0,0)');
+    A.fillStyle = grd; A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+    const gg = G.createRadialGradient(x, y, 0, x, y, r);
+    gg.addColorStop(0, 'rgba(242,242,242,0.62)'); gg.addColorStop(1, 'rgba(0,0,0,0)');
+    G.fillStyle = gg; G.beginPath(); G.arc(x, y, r, 0, 7); G.fill();
+  }
+  return {
+    map: tex(alb, true),
+    normalMap: tex(canvasToNormal(hgt, opts.bump ?? 2.0), false),
+    roughnessMap: tex(rgh, false),
+    metalness: F.metal
+  };
+}
+
+/** 车削件（枪管 / 轮毂 / 弹鼓）专用贴图。
+ *  关键区别：所有细节**只沿轴向（v）变化**，绕圆周方向（u）完全均匀。
+ *  圆柱体的 UV 是绕一圈 0~1 包裹的，如果像普通贴图那样在贴图边框画磨损带，
+ *  枪管上就会绕着一圈"磨白的接缝" —— 一眼假。这里 u 方向无缝，接缝问题从根上消失。
+ *  画布：x = 圆周方向，y = 轴向（枪管长度方向）。 */
+function makeTubeMaps(opts = {}) {
+  const w = opts.w || 256;             // 圆周方向像素
+  const h = opts.h || 512;             // 轴向像素
+  const seed = opts.seed || 5;
+  const base = opts.base || [118, 120, 126];
+  const wear = opts.wear || [206, 210, 216];
+  const metal = opts.metal ?? 0.92;
+  const heat = opts.heat ?? 1;         // 枪口热变色强度
+  const sooty = opts.sooty ?? 1;       // 尾端积碳
+  const R = seeded(seed * 3571 + 91);
+  const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+  const alb = document.createElement('canvas'); alb.width = w; alb.height = h;
+  const hgt = document.createElement('canvas'); hgt.width = w; hgt.height = h;
+  const rgh = document.createElement('canvas'); rgh.width = w; rgh.height = h;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+
+  // 坐标约定：
+  //   x = 圆周方向（u，绕一圈 0→1，**必须无缝**）
+  //   y = 轴向（画布底行 = 枪口，因为 three.js flipY=true 时 v=0 对应画布底行，
+  //       而圆柱体旋转后 v=0 端正好是枪口）
+  const MOUTH = 1;      // 枪口端强度
+  const yMouth = h;    // 枪口在画布底部
+
+  // ── 0. 底色 ────────────────────────────────────────────
+  A.fillStyle = rgb(base); A.fillRect(0, 0, w, h);
+  H.fillStyle = '#808080'; H.fillRect(0, 0, w, h);
+  G.fillStyle = '#9a9a9a'; G.fillRect(0, 0, w, h);
+
+  // ── 1. 大尺度斑驳（氧化 / 油污不均）────────────────────
+  // 用**周期性**的方式画：斑块画在 x 处时，同时在 x±w 处补一份，保证绕圈无缝。
+  const wrapBlob = (ctx, draw) => { draw(0); draw(w); draw(-w); };
+  for (let i = 0; i < 46; i++) {
+    const cx = R() * w, cy = R() * h;
+    const rx = 12 + R() * 70, ry = 10 + R() * 60;
+    const dark = R() < 0.62;
+    const amt = 0.05 + R() * 0.16;
+    wrapBlob(A, (ox) => {
+      const g = A.createRadialGradient(cx + ox, cy, 0, cx + ox, cy, Math.max(rx, ry));
+      g.addColorStop(0, dark ? `rgba(26,27,31,${amt})` : `rgba(196,200,210,${amt * 0.7})`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      A.fillStyle = g;
+      A.beginPath(); A.ellipse(cx + ox, cy, rx, ry, R() * 3, 0, 7); A.fill();
+    });
+    wrapBlob(G, (ox) => {
+      const g = G.createRadialGradient(cx + ox, cy, 0, cx + ox, cy, Math.max(rx, ry));
+      g.addColorStop(0, dark ? 'rgba(220,220,220,0.35)' : 'rgba(60,60,60,0.3)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      G.fillStyle = g;
+      G.beginPath(); G.ellipse(cx + ox, cy, rx, ry, 0, 0, 7); G.fill();
+    });
+  }
+
+  // ── 2. 车削横纹（**水平线**，因为圆周上的车痕在贴图里就是一整条横线）──
+  // 这是"车削金属"最强的视觉线索。噪声做不出来，必须一条条画。
+  for (let i = 0; i < 420; i++) {
+    const y = R() * h;
+    const bright = R() < 0.42;
+    const a = 0.05 + R() * 0.30;
+    const lw = R() < 0.15 ? 1.6 + R() * 1.8 : 0.5 + R() * 0.7;
+    // 一条车痕不是纯直线：有轻微的"车刀跳动"，用贝塞尔画
+    const seg = 6;
+    const wob = (R() - 0.5) * 1.6;
+    A.strokeStyle = bright ? `rgba(214,220,232,${a})` : `rgba(24,25,29,${a * 0.95})`;
+    A.lineWidth = lw;
+    A.beginPath(); A.moveTo(-4, y);
+    for (let s = 1; s <= seg; s++) {
+      A.lineTo(-4 + (w + 8) * (s / seg), y + Math.sin(s * 1.7 + i) * wob);
+    }
+    A.stroke();
+    // 高度图：车痕是沟槽（暗）
+    H.strokeStyle = `rgba(70,70,70,${0.35 + R() * 0.4})`;
+    H.lineWidth = lw * 0.9;
+    H.beginPath(); H.moveTo(-4, y);
+    for (let s = 1; s <= seg; s++) H.lineTo(-4 + (w + 8) * (s / seg), y + Math.sin(s * 1.7 + i) * wob);
+    H.stroke();
+    // 粗糙度：沟槽里更粗糙
+    G.strokeStyle = `rgba(215,215,215,${0.28 + R() * 0.35})`;
+    G.lineWidth = lw;
+    G.beginPath(); G.moveTo(-4, y);
+    for (let s = 1; s <= seg; s++) G.lineTo(-4 + (w + 8) * (s / seg), y + Math.sin(s * 1.7 + i) * wob);
+    G.stroke();
+  }
+  // 几道**粗车刀痕**：明显更深、更宽，一圈圈的加工节距
+  for (let i = 0; i < 9; i++) {
+    const y = R() * h;
+    A.strokeStyle = `rgba(16,17,20,${0.30 + R() * 0.28})`;
+    A.lineWidth = 2.2 + R() * 2.4;
+    A.beginPath(); A.moveTo(-4, y); A.lineTo(w + 4, y + (R() - 0.5) * 2); A.stroke();
+    H.strokeStyle = 'rgba(52,52,52,0.8)';
+    H.lineWidth = 3;
+    H.beginPath(); H.moveTo(-4, y); H.lineTo(w + 4, y); H.stroke();
+    A.strokeStyle = `rgba(224,228,238,${0.18 + R() * 0.2})`;
+    A.lineWidth = 1;
+    A.beginPath(); A.moveTo(-4, y + 2.2); A.lineTo(w + 4, y + 2.2); A.stroke();
+  }
+
+  // ── 3. 轴向划痕（沿枪管被蹭出来的长痕，竖直方向）────────
+  for (let i = 0; i < 110; i++) {
+    const x = R() * w, y = R() * h;
+    const len = 12 + R() * R() * 190;
+    const bright = R() < 0.5;
+    const wid = 0.4 + R() * 1.4;
+    const drawAt = (ox) => {
+      A.strokeStyle = bright ? `rgba(226,231,240,${0.14 + R() * 0.34})` : `rgba(9,10,13,${0.14 + R() * 0.3})`;
+      A.lineWidth = wid;
+      A.beginPath(); A.moveTo(x + ox, y); A.lineTo(x + ox, y + len); A.stroke();
+      H.strokeStyle = `rgba(${bright ? 205 : 62},${bright ? 205 : 62},${bright ? 205 : 62},${0.35 + R() * 0.35})`;
+      H.lineWidth = wid * 1.2;
+      H.beginPath(); H.moveTo(x + ox, y); H.lineTo(x + ox, y + len); H.stroke();
+      G.strokeStyle = `rgba(${bright ? 38 : 215},${bright ? 38 : 215},${bright ? 38 : 215},0.55)`;
+      G.lineWidth = wid + 0.6;
+      G.beginPath(); G.moveTo(x + ox, y); H.beginPath(); G.moveTo(x + ox, y); G.lineTo(x + ox, y + len); G.stroke();
+    };
+    drawAt(0);
+    if (x < 4 || x > w - 4) { drawAt(x < 4 ? w : -w); }
+  }
+
+  // ── 4. 膛口热变色：水平色带（真实的氧化蓝 / 稻草黄环）──
+  if (heat > 0) {
+    const bands = 7;
+    for (let i = 0; i < bands; i++) {
+      const t0 = i / bands;
+      const y0 = yMouth - h * 0.16 * (1 - t0) - h * 0.012;
+      const hh = h * 0.016 * (1 - t0 * 0.6);
+      const hue = 0.62 - i * 0.075;      // 从金黄 → 紫 → 蓝
+      const cr = 120 + 100 * Math.cos(hue);
+      const cg = 108 + 86 * Math.cos(hue - 2.094);
+      const cb = 116 + 104 * Math.cos(hue - 4.188);
+      const a = (0.30 + 0.22 * (1 - t0)) * heat;
+      const gg = A.createLinearGradient(0, y0, 0, y0 + hh);
+      gg.addColorStop(0, `rgba(${cr | 0},${cg | 0},${cb | 0},0)`);
+      gg.addColorStop(0.5, `rgba(${cr | 0},${cg | 0},${cb | 0},${a})`);
+      gg.addColorStop(1, `rgba(${cr | 0},${cg | 0},${cb | 0},0)`);
+      A.fillStyle = gg;
+      A.fillRect(0, y0, w, hh);
+      G.fillStyle = `rgba(70,70,70,${a * 0.9})`;   // 氧化层更粗糙
+      G.fillRect(0, y0, w, hh);
+    }
+  }
+
+  // ── 5. 膛口磨亮带（最前面一段被摩擦抛光的钢）─────────────
+  {
+    const yTop = yMouth - h * 0.13;
+    const gg = A.createLinearGradient(0, yTop, 0, yMouth);
+    gg.addColorStop(0, 'rgba(0,0,0,0)');
+    gg.addColorStop(0.55, rgb(wear, 0.34 * MOUTH));
+    gg.addColorStop(1, rgb(wear, 0.62 * MOUTH));
+    A.fillStyle = gg; A.fillRect(0, yTop, w, yMouth - yTop);
+    // 被磨亮的地方更光滑
+    const gr = G.createLinearGradient(0, yTop, 0, yMouth);
+    gr.addColorStop(0, 'rgba(0,0,0,0)');
+    gr.addColorStop(1, 'rgba(34,34,34,0.85)');
+    G.fillStyle = gr; G.fillRect(0, yTop, w, yMouth - yTop);
+    // 高度：磨亮区被磨平
+    H.fillStyle = 'rgba(150,150,150,0.55)';
+    H.fillRect(0, yTop, w, yMouth - yTop);
+  }
+
+  // ── 6. 尾端积碳 ─────────────────────────────────────────
+  if (sooty > 0) {
+    const y0 = h * 0.84;
+    const gg = A.createLinearGradient(0, y0, 0, 0);
+    gg.addColorStop(0, 'rgba(0,0,0,0)');
+    gg.addColorStop(1, `rgba(20,18,17,${0.82 * sooty})`);
+    A.fillStyle = gg; A.fillRect(0, 0, w, y0);
+    const gr = G.createLinearGradient(0, y0, 0, 0);
+    gr.addColorStop(0, 'rgba(0,0,0,0)');
+    gr.addColorStop(1, 'rgba(235,235,235,0.85)');
+    G.fillStyle = gr; G.fillRect(0, 0, w, y0);
+    H.fillStyle = 'rgba(190,190,190,0.35)';   // 积碳是附着层，凸起
+    H.fillRect(0, 0, w, y0);
+  }
+
+  // ── 7. 膛口碰伤（弹着点磕出来的坑）──────────────────────
+  for (let i = 0; i < 26; i++) {
+    const x = R() * w, y = yMouth - R() * h * 0.22;
+    const r = 1.2 + R() * 5.5;
+    const drawAt = (ox) => {
+      A.fillStyle = `rgba(212,218,230,${0.16 + R() * 0.3})`;
+      A.beginPath(); A.ellipse(x + ox, y, r, r * 0.62, 0, 0, 7); A.fill();
+      H.fillStyle = 'rgba(70,70,70,0.62)';
+      H.beginPath(); H.ellipse(x + ox, y, r * 0.8, r * 0.5, 0, 0, 7); H.fill();
+      G.fillStyle = 'rgba(48,48,48,0.5)';
+      G.beginPath(); G.ellipse(x + ox, y, r * 0.8, r * 0.5, 0, 0, 7); G.fill();
+    };
+    drawAt(0);
+    if (x < 5 || x > w - 5) drawAt(x < 5 ? w : -w);
+  }
+
+  // ── 8. 细密颗粒（微观粗糙感，铺在最上层）────────────────
+  {
+    const id = A.getImageData(0, 0, w, h), d = id.data;
+    for (let i = 0; i < w * h; i++) {
+      const n = (hashNoise(i % w, (i / w) | 0, seed) - 0.5) * 26;
+      d[i * 4] = clamp(d[i * 4] + n, 0, 255);
+      d[i * 4 + 1] = clamp(d[i * 4 + 1] + n, 0, 255);
+      d[i * 4 + 2] = clamp(d[i * 4 + 2] + n, 0, 255);
+    }
+    A.putImageData(id, 0, 0);
+  }
+
+  return {
+    map: tex(alb, true),
+    normalMap: tex(canvasToNormalRect(hgt, opts.bump ?? 2.4), false),
+    roughnessMap: tex(rgh, false),
+    metalness: metal
+  };
+}
+/** 圆角长方体。
+ *  立方体的 12 条棱是数学上的锐边，在渲染里只有一条硬边高光 —— 看起来像塑料。
+ *  真实金属件的棱都有倒角（或者干脆是圆角），边缘会出现一条**渐变的高光带**，
+ *  这条带子才是"金属感"的主要来源。
+ *  做法：把顶点向"内框 + 半径"的球面推。 */
+function roundedBox(w, h, d, r, seg = 3) {
+  const g = new THREE.BoxGeometry(w, h, d, seg, seg, seg);
+  const pos = g.attributes.position;
+  const hx = Math.max(0.001, w / 2 - r), hy = Math.max(0.001, h / 2 - r), hz = Math.max(0.001, d / 2 - r);
+  for (let i = 0; i < pos.count; i++) {
+    const px = pos.getX(i), py = pos.getY(i), pz = pos.getZ(i);
+    const cx = Math.max(-hx, Math.min(hx, px));
+    const cy = Math.max(-hy, Math.min(hy, py));
+    const cz = Math.max(-hz, Math.min(hz, pz));
+    let dx = px - cx, dy = py - cy, dz = pz - cz;
+    const len = Math.hypot(dx, dy, dz);
+    if (len > 1e-6) {
+      const k = r / len;
+      pos.setXYZ(i, cx + dx * k, cy + dy * k, cz + dz * k);
+    }
+  }
+  g.computeVertexNormals();
+  return g;
+}
+
+/** 打散 BoxGeometry 各面的 UV。
+ *  BoxGeometry 每个面的 UV 都是 0~1，所以同一个 Box 上的 6 个面会贴**一模一样**的图，
+ *  近看就是明显的"复制粘贴"。这里给每个面单独做一次旋转 + 平移 + 镜像，
+ *  让 6 个面看起来像同一块料子加工出来的不同表面。 */
+function offsetBoxFaces(geo, seed = 1) {
+  const R = seeded(seed * 6151 + 29);
+  const uv = geo.attributes.uv;
+  const face = geo.groups.length >= 6 ? 6 : Math.floor(uv.count / 4);
+  const per = Math.floor(uv.count / face);
+  for (let f = 0; f < face; f++) {
+    const rot = Math.floor(R() * 4);            // 0/90/180/270 度
+    const flip = R() < 0.4;
+    for (let k = f * per; k < (f + 1) * per && k < uv.count; k++) {
+      let u = uv.getX(k), v = uv.getY(k);
+      if (flip) u = 1 - u;
+      for (let r = 0; r < rot; r++) { const t = u; u = v; v = 1 - t; }
+      // 只做旋转 / 镜像，**不做平移**：
+      // 平移会让 UV 越过 0/1，在 RepeatWrapping 下把贴图边框那条磨损带
+      // 复制到面的中间，看起来像零件上多了一圈亮线。
+      uv.setXY(k, u, v);
+    }
+  }
+  uv.needsUpdate = true;
+  return geo;
+}
+
+/** 聚合物握把：菱形颗粒纹（真实枪械握把最标志性的表面处理） */
+function makeStippleMaps(size = 256) {
+  const R = seeded(7717);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), H = hgt.getContext('2d'), G = rgh.getContext('2d');
+  A.fillStyle = '#2c2e33'; A.fillRect(0, 0, size, size);
+  H.fillStyle = '#3a3a3a'; H.fillRect(0, 0, size, size);
+  G.fillStyle = '#c8c8c8'; G.fillRect(0, 0, size, size);
+  // 菱形网格颗粒
+  const cell = size / 14;
+  for (let gy = 0; gy < 14; gy++) {
+    for (let gx = 0; gx < 14; gx++) {
+      const cx = (gx + 0.5) * cell + (gy % 2 ? cell * 0.5 : 0);
+      const cy = (gy + 0.5) * cell;
+      const rr = cell * 0.40;
+      // 凸起的菱形：亮顶 + 暗底
+      const g1 = A.createRadialGradient(cx - rr * 0.3, cy - rr * 0.3, 0, cx, cy, rr);
+      g1.addColorStop(0, 'rgba(112,116,124,0.55)');
+      g1.addColorStop(0.55, 'rgba(58,60,66,0.25)');
+      g1.addColorStop(1, 'rgba(12,13,16,0.42)');
+      A.fillStyle = g1;
+      A.beginPath(); A.moveTo(cx, cy - rr); A.lineTo(cx + rr, cy);
+      A.lineTo(cx, cy + rr); A.lineTo(cx - rr, cy); A.closePath(); A.fill();
+      // 高度：菱形中央凸起
+      const hh = H.createRadialGradient(cx, cy, 0, cx, cy, rr);
+      hh.addColorStop(0, 'rgba(230,230,230,0.85)');
+      hh.addColorStop(1, 'rgba(40,40,40,0.6)');
+      H.fillStyle = hh;
+      H.beginPath(); A.beginPath();
+      H.moveTo(cx, cy - rr); H.lineTo(cx + rr, cy);
+      H.lineTo(cx, cy + rr); H.lineTo(cx - rr, cy); H.closePath(); H.fill();
+      // 粗糙度：凸起处被磨得稍亮
+      G.fillStyle = 'rgba(150,150,150,0.55)';
+      G.beginPath(); G.moveTo(cx, cy - rr); G.lineTo(cx + rr, cy);
+      G.lineTo(cx, cy + rr); G.lineTo(cx - rr, cy); G.closePath(); G.fill();
+    }
+  }
+  // 使用痕迹（磨掉颗粒的亮斑）
+  for (let i = 0; i < 26; i++) {
+    const x = R() * size, y = R() * size, r = 5 + R() * 26;
+    const g2 = A.createRadialGradient(x, y, 0, x, y, r);
+    g2.addColorStop(0, 'rgba(120,124,132,0.30)'); g2.addColorStop(1, 'rgba(0,0,0,0)');
+    A.fillStyle = g2; A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+    const g3 = G.createRadialGradient(x, y, 0, x, y, r);
+    g3.addColorStop(0, 'rgba(90,90,90,0.5)'); g3.addColorStop(1, 'rgba(0,0,0,0)');
+    G.fillStyle = g3; G.beginPath(); G.arc(x, y, r, 0, 7); G.fill();
+  }
+  // 聚合物不会像金属那样光滑：加一层细砂噪点 + 纤维感，
+  // 否则颗粒纹之外的地方是一整块死平的色块，远看就像塑料玩具。
+  const px = A.getImageData(0, 0, size, size);
+  const rx = G.getImageData(0, 0, size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const n1 = hashNoise(x, y, 4242);
+      const n2 = hashNoise(x >> 1, y >> 1, 8484);
+      const fib = Math.sin(x * 0.9 + n2 * 3.0) * 0.5 + 0.5;   // 横向纤维
+      const k = 1 + (n1 - 0.5) * 0.30 + (n2 - 0.5) * 0.16 + (fib - 0.5) * 0.07;
+      px.data[i] = clamp(px.data[i] * k, 0, 255);
+      px.data[i + 1] = clamp(px.data[i + 1] * k, 0, 255);
+      px.data[i + 2] = clamp(px.data[i + 2] * k * 1.02, 0, 255);
+      rx.data[i] = rx.data[i + 1] = rx.data[i + 2] =
+        clamp(rx.data[i] + (n1 - 0.5) * 46, 0, 255);
+    }
+  }
+  A.putImageData(px, 0, 0); G.putImageData(rx, 0, 0);
+  return {
+    map: tex(alb, true),
+    normalMap: tex(canvasToNormal(hgt, 3.2), false),
+    roughnessMap: tex(rgh, false)
+  };
+}
+
+/** 激光刻字 / 滚花标识：透明贴花（带凹槽法线，边缘有高光） */
+function makeMarkingMaps(w, h, lines) {
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+  const g = cv.getContext('2d');
+  const hc = document.createElement('canvas'); hc.width = w; hc.height = h;
+  const hg = hc.getContext('2d');
+  g.clearRect(0, 0, w, h); hg.fillStyle = '#000'; hg.fillRect(0, 0, w, h);
+
+  let y = h * 0.34;
+  for (const L of lines) {
+    const size = L.size || h * 0.42;
+    g.font = `700 ${size}px "Arial Narrow", "Helvetica", Arial`;
+    hg.font = g.font;
+    g.textAlign = 'center'; hg.textAlign = 'center';
+    const txt = L.text;
+    // 刻槽：暗色主体 + 下方一像素高光（模拟凹槽下沿被照亮）
+    g.fillStyle = 'rgba(212,216,224,0.92)';
+    g.fillText(txt, w / 2, y + size * 0.06);
+    g.fillStyle = 'rgba(18,20,26,0.85)';
+    g.fillText(txt, w / 2, y);
+    hg.fillStyle = '#fff';
+    hg.fillText(txt, w / 2, y);
+    y += size * (L.gap ?? 1.35);
+  }
+  // 高度图：文字区域为凹槽（低），周围为平面（高）
+  const hd = hg.getImageData(0, 0, w, h).data;
+  const hp = hg.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    const t = hd[i * 4] / 255;                 // 文字=1，其余=0
+    const v = t ? 60 : 140;                    // 凹槽更低
+    hp.data[i * 4] = hp.data[i * 4 + 1] = hp.data[i * 4 + 2] = v;
+    hp.data[i * 4 + 3] = 255;
+  }
+  hg.putImageData(hp, 0, 0);
+  return {
+    map: tex(cv, true),
+    normalMap: tex(canvasToNormal(hc, 2.6), false)
+  };
+}
+
+/* ---------- 材质库 ---------- */
+const MAT = {};
+function initMaterials() {
+  const skin = makeSurfaceMaps({ type: 'skin', base: [196, 156, 128], rough: 0.58, seed: 3, bump: 1.6, repeat: 2 });
+  const jacket = makeSurfaceMaps({ type: 'fabric', base: [46, 50, 66], rough: 0.86, seed: 11, bump: 2.6, repeat: 3 });
+  const pants = makeSurfaceMaps({ type: 'fabric', base: [38, 40, 50], rough: 0.9, seed: 23, bump: 2.8, repeat: 3 });
+  const gunmetal = makeSurfaceMaps({ type: 'metal', base: [74, 76, 82], rough: 0.34, seed: 31, bump: 1.4, repeat: 2 });
+  const polymer = makeSurfaceMaps({ type: 'polymer', base: [40, 42, 48], rough: 0.74, seed: 47, bump: 3.0, repeat: 4 });
+  const hair = makeSurfaceMaps({ type: 'hair', base: [34, 26, 22], rough: 0.62, seed: 53, bump: 2.2, repeat: 2 });
+  const leather = makeSurfaceMaps({ type: 'polymer', base: [44, 34, 28], rough: 0.66, seed: 61, bump: 2.4, repeat: 3 });
+  const scales = makeSurfaceMaps({ type: 'scales', base: [98, 110, 82], rough: 0.62, seed: 71, bump: 3.6, repeat: 3, cells: 16 });
+  const belly  = makeSurfaceMaps({ type: 'skin', base: [152, 148, 124], rough: 0.78, seed: 89, bump: 1.8, repeat: 2 });
+  const plate  = makeSurfaceMaps({ type: 'polymer', base: [124, 128, 120], rough: 0.55, seed: 97, bump: 2.6, repeat: 2 });
+
+  MAT.skin   = new THREE.MeshStandardMaterial({ ...skin, color: 0xffffff, metalness: 0.02, roughness: 1, envMapIntensity: 0.5 });
+  MAT.jacket = new THREE.MeshStandardMaterial({ ...jacket, color: 0xffffff, metalness: 0.04, roughness: 1, envMapIntensity: 0.4 });
+  MAT.pants  = new THREE.MeshStandardMaterial({ ...pants, color: 0xffffff, metalness: 0.04, roughness: 1, envMapIntensity: 0.35 });
+  MAT.gunmetal = new THREE.MeshStandardMaterial({ ...gunmetal, color: 0xffffff, metalness: 0.92, roughness: 1, envMapIntensity: 1.15 });
+  MAT.polymer  = new THREE.MeshStandardMaterial({ ...polymer, color: 0xffffff, metalness: 0.06, roughness: 1, envMapIntensity: 0.55 });
+  MAT.hair   = new THREE.MeshStandardMaterial({ ...hair, color: 0xffffff, metalness: 0.05, roughness: 1, envMapIntensity: 0.5 });
+  MAT.leather = new THREE.MeshStandardMaterial({ ...leather, color: 0xffffff, metalness: 0.05, roughness: 1, envMapIntensity: 0.5 });
+  // —— 巨兽（哥斯拉型）：鳞甲 / 腹板 / 背板 ——
+  MAT.kaijuScale = new THREE.MeshStandardMaterial({ ...scales, color: 0xffffff, metalness: 0.08, roughness: 1, envMapIntensity: 0.62 });
+  MAT.kaijuBelly = new THREE.MeshStandardMaterial({ ...belly, color: 0xffffff, metalness: 0.04, roughness: 1, envMapIntensity: 0.45 });
+  MAT.kaijuPlate = new THREE.MeshStandardMaterial({ ...plate, color: 0xffffff, metalness: 0.12, roughness: 1, envMapIntensity: 0.6 });
+
+  // 场景材质
+  const floor = makeFloorMaps(1536);
+  MAT.floor = new THREE.MeshStandardMaterial({
+    ...floor, color: 0xffffff, metalness: 0.24, roughness: 1, envMapIntensity: 1.05
+  });
+  MAT.floor.map.repeat.set(1, 1);              // albedo 大图不重复（保留唯一的裂缝/标线/水洼布局）
+  MAT.floor.roughnessMap.repeat.set(1, 1);
+  MAT.floor.normalMap.repeat.set(6, 6);        // 法线高频重复，补足近处的颗粒感
+
+  const panel = makePanelMaps(512);
+  MAT.wall = new THREE.MeshStandardMaterial({
+    ...panel, color: 0xffffff, metalness: 0.68, roughness: 1, envMapIntensity: 0.8
+  });
+  MAT.wall.map.repeat.set(6, 1.4);
+  MAT.wall.normalMap.repeat.set(6, 1.4);
+  MAT.wall.roughnessMap.repeat.set(6, 1.4);
+  const pillar = makePillarMaps(512);
+  MAT.pillar = new THREE.MeshStandardMaterial({
+    ...pillar, color: 0xffffff, metalness: 0.6, roughness: 1, envMapIntensity: 0.75
+  });
+  MAT.ceiling = new THREE.MeshStandardMaterial({
+    color: 0x333c4c, roughness: 0.94, metalness: 0.3
+  });
+  MAT.pipe = new THREE.MeshStandardMaterial({ color: 0x424a56, roughness: 0.52, metalness: 0.78, envMapIntensity: 0.8 });
+
+  // —— 枪械：按零件的表面处理分开，每种 finish 有自己的斑驳与磨损 ——
+  // 套筒：发蓝钢（最亮、磨损最重的活动件）
+  const slideMaps = makeGunMetalMaps({ finish: 'blued', size: 512, seed: 3, bump: 3.2 });
+  MAT.gunSlide = new THREE.MeshStandardMaterial({
+    ...slideMaps, color: 0xffffff, roughness: 1, envMapIntensity: 2.1
+  });
+  // 机匣 / 框架：磷化钢
+  const frameMaps = makeGunMetalMaps({ finish: 'phosphate', size: 512, seed: 17, bump: 3.0 });
+  MAT.gunFrame = new THREE.MeshStandardMaterial({
+    ...frameMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.45
+  });
+  // 枪管：发黑
+  const barrelMaps = makeGunMetalMaps({ finish: 'black', size: 256, seed: 29, bump: 2.6 });
+  MAT.gunBarrel = new THREE.MeshStandardMaterial({
+    ...barrelMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.4
+  });
+  // 黑色氧化件（弹匣 / 导轨 / 小零件）
+  const darkMaps = makeGunMetalMaps({ finish: 'black', size: 256, seed: 41, bump: 2.8 });
+  MAT.gunDark = new THREE.MeshStandardMaterial({
+    ...darkMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.5
+  });
+  // 不锈钢件（弹鼓轴 / 导杆）
+  const steelMaps = makeGunMetalMaps({ finish: 'stainless', size: 256, seed: 53, bump: 2.5 });
+  MAT.gunSteel = new THREE.MeshStandardMaterial({
+    ...steelMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.55
+  });
+  // 聚合物握把：菱形颗粒纹
+  const stip = makeStippleMaps(256);
+  MAT.gunPoly = new THREE.MeshStandardMaterial({
+    ...stip, color: 0xffffff, metalness: 0.03, roughness: 1, envMapIntensity: 0.7
+  });
+  // 套筒顶部：长期插在枪套里 → 被磨得更亮、还积着一层浮灰
+  const topMaps = makeGunMetalMaps({ finish: 'blued', size: 256, seed: 83, bump: 3.0, lighten: 1.55, dust: 0.85 });
+  MAT.gunSlideTop = new THREE.MeshStandardMaterial({
+    ...topMaps, color: 0xffffff, roughness: 1, envMapIntensity: 2.0
+  });
+
+  // —— 车削件（加特林枪管 / 轮毂 / 弹鼓 / 散热套筒）——
+  // 圆柱体的 UV 绕圆周包裹，所以这类零件必须用**轴向无缝**的贴图，
+  // 否则贴图边框的磨损带会在枪管上绕出假的接缝。
+  const tubeMaps = makeTubeMaps({ w: 256, h: 512, seed: 5, base: [146, 149, 156], wear: [224, 228, 234], metal: 0.93, heat: 1.0, sooty: 1, bump: 2.6 });
+  MAT.gunTube = new THREE.MeshStandardMaterial({
+    ...tubeMaps, color: 0xffffff, roughness: 1, envMapIntensity: 2.0
+  });
+  // 散热套筒：发黑处理 + 散热孔边缘被烤出来的金属亮边
+  const shroudMaps = makeTubeMaps({ w: 256, h: 512, seed: 23, base: [84, 86, 93], wear: [186, 188, 194], metal: 0.84, heat: 0.55, sooty: 0.6, bump: 2.8 });
+  MAT.gunShroud = new THREE.MeshStandardMaterial({
+    ...shroudMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.6
+  });
+  // 弹鼓：磷化钢，外圈有磨损亮边
+  const drumMaps = makeTubeMaps({ w: 256, h: 256, seed: 37, base: [110, 112, 118], wear: [200, 202, 208], metal: 0.78, heat: 0.2, sooty: 0.8, bump: 2.4 });
+  MAT.gunDrum = new THREE.MeshStandardMaterial({
+    ...drumMaps, color: 0xffffff, roughness: 1, envMapIntensity: 1.45
+  });
+  // 兼容旧引用
+  MAT.gunWorn = MAT.gunFrame;
+}
+
+/** 生成环境贴图：金属没有可反射的环境就不像金属 */
+function makeEnvMap() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 256;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 256);
+  grd.addColorStop(0.00, '#6d7ea3');
+  grd.addColorStop(0.42, '#2b3350');
+  grd.addColorStop(0.52, '#12162a');
+  grd.addColorStop(1.00, '#070a12');
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 256);
+  // 模拟几盏顶灯 / 霓虹灯带
+  const light = (x, y, w, h, col) => { g.fillStyle = col; g.fillRect(x, y, w, h); };
+  light(40, 24, 110, 22, 'rgba(255,255,255,0.95)');
+  light(250, 40, 150, 26, 'rgba(150,220,255,0.6)');
+  light(150, 8, 70, 16, 'rgba(255,214,170,0.55)');
+  light(400, 60, 90, 20, 'rgba(255,120,180,0.4)');
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const env = pmrem.fromEquirectangular(t).texture;
+  pmrem.dispose(); t.dispose();
+  return env;
+}
+
+/** 枪械专用环境贴图：高对比度的"影棚灯管"。
+ *  世界环境是暗蓝工业风，套在枪上只会反射出一团糊；真实枪械特写里金属面上
+ *  永远是几道清晰的长条高光（顶灯灯管 + 侧向柔光箱）。单独给枪械做一张
+ *  低分辨率的等距柱状环境，PMREM 之后作为 envMap 挂在枪械材质上。 */
+function makeGunEnvMap() {
+  const c = document.createElement('canvas'); c.width = 512; c.height = 256;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 256);
+  grd.addColorStop(0.00, '#232830');   // 天顶：暗，亮点全靠灯管
+  grd.addColorStop(0.30, '#3c434e');
+  grd.addColorStop(0.52, '#171b21');   // 地平线：最暗
+  grd.addColorStop(0.72, '#22262c');
+  grd.addColorStop(1.00, '#0a0c0f');   // 地面
+  g.fillStyle = grd; g.fillRect(0, 0, 512, 256);
+
+  // 顶部灯管：多条平行白条 → 金属面上拉出细长高光（最关键的一层）
+  for (let i = 0; i < 7; i++) {
+    const y = 6 + i * 15;
+    const x = 24 + ((i * 113) % 330);
+    const w = 96 + i * 22;
+    const lg = g.createLinearGradient(x, 0, x + w, 0);
+    lg.addColorStop(0, 'rgba(255,255,255,0)');
+    lg.addColorStop(0.42, 'rgba(255,253,247,0.98)');
+    lg.addColorStop(0.58, 'rgba(255,250,240,0.92)');
+    lg.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = lg;
+    g.fillRect(x, y, w, 7 + (i % 2) * 3);
+  }
+  // 侧向柔光箱：左右各一块大面积柔光，给出柔和的体积感
+  const soft = (x0, w, col) => {
+    const sg = g.createRadialGradient(x0, 118, 4, x0, 118, w);
+    sg.addColorStop(0, col); sg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = sg; g.fillRect(x0 - w, 40, w * 2, 170);
+  };
+  soft(96, 130, 'rgba(255,236,206,0.55)');
+  soft(408, 130, 'rgba(150,200,255,0.45)');
+  // 远处霓虹的反光：给边缘一点色彩
+  g.fillStyle = 'rgba(255,90,150,0.30)'; g.fillRect(236, 104, 46, 12);
+  g.fillStyle = 'rgba(90,220,255,0.26)'; g.fillRect(300, 96, 38, 10);
+
+  const t = new THREE.CanvasTexture(c);
+  t.mapping = THREE.EquirectangularReflectionMapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  const pm = new THREE.PMREMGenerator(renderer);
+  const env = pm.fromEquirectangular(t).texture;
+  pm.dispose(); t.dispose();
+  return env;
+}
+
+/* ============================================================
+   4. 敌人
+   ============================================================ */
+const ENEMY_TYPES = {
+  grunt:  { hp: 45,  r: 0.55, speed: 4.2,  color: 0xff4d6d, score: 100,  melee: 10 },
+  shooter:{ hp: 38,  r: 0.5,  speed: 3.2,  color: 0xc04dff, score: 180,  melee: 10 },
+  tank:   { hp: 190, r: 1.0,  speed: 2.2,  color: 0x39d98a, score: 400,  melee: 22 },
+  kaiju:  { hp: 340, r: 0.72, speed: 3.4,  color: 0xff7a33, score: 1200, melee: 32 },
+  boss:   { hp: 900, r: 1.7,  speed: 2.6,  color: 0xff2f6d, score: 3000, melee: 26 }
+};
+/* ---------- 人形敌人：全部由基本体拼装，带行走/挥击动画 ---------- */
+const BODY_SPEC = {
+  grunt:   { s: 1.00, w: 1.00, h: 1.00, walk: 6.5 },
+  shooter: { s: 1.00, w: 0.94, h: 1.00, walk: 6.0 },
+  tank:    { s: 1.42, w: 1.50, h: 1.06, walk: 4.2 },
+  kaiju:   { s: 1.60, w: 1.20, h: 1.15, walk: 2.4 },
+  boss:    { s: 2.05, w: 1.34, h: 1.14, walk: 3.6 }
+};
+function makeHumanoid(type) {
+  const t = ENEMY_TYPES[type];
+  const spec = BODY_SPEC[type];
+  const root = new THREE.Group();
+  const body = new THREE.Group();          // 朝向 / 起伏用
+  root.add(body);
+
+  // 每个敌人独立一份材质实例（命中白闪要单独控制），贴图本身共享
+  const M = {
+    skin: MAT.skin.clone(), jacket: MAT.jacket.clone(), pants: MAT.pants.clone(),
+    hair: MAT.hair.clone(), leather: MAT.leather.clone()
+  };
+  // 服装带一点敌人类型色，保持辨识度
+  const tint = new THREE.Color(t.color);
+  M.jacket.color.copy(tint).lerp(new THREE.Color(0x8d92ab), 0.74);
+  M.pants.color.copy(tint).lerp(new THREE.Color(0x70768e), 0.82);
+  M.hair.color.setHSL(0.07, 0.32, 0.08 + rand(0, 0.07));
+  M.skin.color.setHSL(0.075, 0.40, 0.48 + rand(-0.14, 0.14));
+
+  // ---- 躯干（夹克）----
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.44 * spec.w, 0.56 * spec.h, 0.26 * spec.w), M.jacket);
+  torso.position.y = 1.12;
+  torso.castShadow = true; torso.receiveShadow = true;
+  body.add(torso);
+
+  // 拉链与口袋
+  const zip = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.50 * spec.h, 0.018), M.leather);
+  zip.position.set(0, 1.12, 0.133 * spec.w);
+  body.add(zip);
+  for (const s of [1, -1]) {
+    const pocket = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.065, 0.018), M.leather);
+    pocket.position.set(s * 0.105 * spec.w, 0.995, 0.132 * spec.w);
+    body.add(pocket);
+  }
+  // 胸口霓虹核心（保留赛博感）
+  const chest = new THREE.Mesh(new THREE.SphereGeometry(0.072, 10, 8),
+    new THREE.MeshBasicMaterial({ color: t.color, toneMapped: false }));
+  chest.position.set(0, 1.21, 0.135 * spec.w);
+  body.add(chest);
+  addGlow(chest, t.color, 0.46, 0.75);
+
+  // ---- 腰带 / 髋 ----
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(0.40 * spec.w, 0.055, 0.27 * spec.w), M.leather);
+  belt.position.y = 0.815;
+  const hips = new THREE.Mesh(new THREE.BoxGeometry(0.37 * spec.w, 0.19, 0.25 * spec.w), M.pants);
+  hips.position.y = 0.74; hips.castShadow = true;
+  body.add(belt, hips);
+
+  // ---- 脖子 ----
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.054, 0.062, 0.1, 8), M.skin);
+  neck.position.y = 1.44; neck.castShadow = true;
+  body.add(neck);
+
+  // ---- 头（爆头命中体）：颅骨 + 下颌 + 头发 + 五官 ----
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.165, 16, 14), M.skin);
+  head.scale.set(1, 1.1, 1.02);
+  head.position.y = 1.58; head.castShadow = true;
+  body.add(head);
+
+  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.1, 0.185), M.skin);
+  jaw.position.set(0, -0.1, 0.025);
+  head.add(jaw);
+
+  const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.175, 14, 12), M.hair);
+  hairCap.scale.set(1.06, 0.92, 1.06);
+  hairCap.position.set(0, 0.05, -0.035);     // 往后偏，露出脸
+  hairCap.castShadow = true;
+  head.add(hairCap);
+
+  const eyeWhite = new THREE.MeshStandardMaterial({ color: 0xded8d2, roughness: 0.32, metalness: 0 });
+  const irisMat = new THREE.MeshStandardMaterial({ color: 0x17120e, roughness: 0.22, metalness: 0 });
+  const mouthMat = new THREE.MeshStandardMaterial({ color: 0x3a2422, roughness: 0.6, metalness: 0 });
+  for (const s of [1, -1]) {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.042, 10, 8), eyeWhite);
+    eye.position.set(s * 0.058, 0.012, 0.135);
+    head.add(eye);
+    const iris = new THREE.Mesh(new THREE.SphereGeometry(0.021, 8, 6), irisMat);
+    iris.position.set(s * 0.058, 0.012, 0.163);
+    head.add(iris);
+    const brow = new THREE.Mesh(new THREE.BoxGeometry(0.062, 0.013, 0.015), M.hair);
+    brow.position.set(s * 0.06, 0.068, 0.15);
+    brow.rotation.z = s * 0.12;
+    head.add(brow);
+  }
+  const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.013, 0.012), mouthMat);
+  mouth.position.set(0, -0.068, 0.152);
+  head.add(mouth);
+  for (const s of [1, -1]) {
+    const ear = new THREE.Mesh(new THREE.SphereGeometry(0.036, 8, 6), M.skin);
+    ear.scale.set(0.5, 1, 0.8);
+    ear.position.set(s * 0.152, -0.005, -0.005);
+    head.add(ear);
+  }
+  // 眼部微光：远距离也能看出敌意
+  const visor = addGlow(head, t.color, 0.4, 0.5);
+  visor.position.set(0, 0.012, 0.16);
+
+  // ---- 肩甲 ----
+  const padGeo = new THREE.BoxGeometry(0.2, 0.13, 0.24);
+  for (const s of [1, -1]) {
+    const pad = new THREE.Mesh(padGeo, M.leather);
+    pad.position.set(s * 0.275 * spec.w, 1.34, 0);
+    pad.castShadow = true;
+    body.add(pad);
+  }
+
+  // ---- 手臂（枢轴在肩）：袖子 + 小臂 + 手 ----
+  const mkArm = (side) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.285 * spec.w, 1.33, 0);
+    const upper = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.30, 0.125), M.jacket);
+    upper.position.y = -0.15; upper.castShadow = true;
+    const fore = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.28, 0.11), M.skin);
+    fore.position.y = -0.44; fore.castShadow = true;
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.115, 0.06), M.skin);
+    hand.position.set(0, -0.635, 0.012); hand.castShadow = true;
+    pivot.add(upper, fore, hand);
+    body.add(pivot);
+    return pivot;
+  };
+  const armL = mkArm(1), armR = mkArm(-1);
+
+  // ---- 腿（枢轴在髋）：裤 + 靴 ----
+  const mkLeg = (side) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.115 * spec.w, 0.72, 0);
+    const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.155, 0.34, 0.16), M.pants);
+    thigh.position.y = -0.17; thigh.castShadow = true;
+    const shin = new THREE.Mesh(new THREE.BoxGeometry(0.135, 0.32, 0.14), M.pants);
+    shin.position.y = -0.48; shin.castShadow = true;
+    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.145, 0.11, 0.25), M.leather);
+    boot.position.set(0, -0.655, 0.035); boot.castShadow = true;
+    pivot.add(thigh, shin, boot);
+    body.add(pivot);
+    return pivot;
+  };
+  const legL = mkLeg(1), legR = mkLeg(-1);
+
+  // ---- 射手手心的能量球 ----
+  let orb = null;
+  if (type === 'shooter') {
+    orb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.12, 0),
+      new THREE.MeshBasicMaterial({ color: t.color, toneMapped: false }));
+    orb.position.set(0, -0.72, 0.09);
+    armR.add(orb);
+    addGlow(orb, t.color, 0.8, 0.9);
+  }
+  // ---- 首领的背光光环 ----
+  if (type === 'boss') {
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0xff9ec4, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
+    });
+    const r1 = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.05, 8, 44), ringMat); r1.rotation.x = Math.PI / 2; r1.position.y = 1.0;
+    const r2 = new THREE.Mesh(new THREE.TorusGeometry(1.8, 0.04, 8, 44), ringMat); r2.rotation.y = Math.PI / 2; r2.position.y = 1.0;
+    body.add(r1, r2);
+    body.userData.rings = [r1, r2];
+  }
+
+  const glow = addGlow(body, t.color, type === 'boss' ? 2.6 : 0.9, 0.55);
+  // 轮廓光：放大一点的背面副本，在暗背景里勾出边缘
+  const rimMat = new THREE.MeshBasicMaterial({
+    color: t.color, transparent: true, opacity: 0.5, side: THREE.BackSide,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
+  });
+  const mkRim = (src, scale) => {
+    const r = new THREE.Mesh(src.geometry, rimMat);
+    r.scale.setScalar(scale);
+    r.position.copy(src.position);
+    r.quaternion.copy(src.quaternion);
+    r.renderOrder = -1;
+    (src.parent || body).add(r);
+    return r;
+  };
+  mkRim(torso, 1.09);
+  mkRim(head, 1.14);
+  for (const s of [1, -1]) {
+    const pad = body.children.find(o => o.isMesh && o.geometry === padGeo && o.position.x === s * 0.275 * spec.w);
+    if (pad) mkRim(pad, 1.12);
+  }
+  root.scale.setScalar(spec.s);
+  return { root, body, torso, head, chest, armL, armR, legL, legR, visor, orb, glow, spec, mats: M, rimMat,
+           top: (1.76 + 0.1) * spec.s };
+}
+/* ---------- 巨兽（哥斯拉型）：四足 + 长尾 + 背板 + 原子吐息 ----------
+ * 坐标约定：模型**面朝 +Z**（updateEnemies 用 lookAt(player) 把 +Z 对准玩家），
+ * 脚底在 y = 0，模型总高约 2.9 单位，最后用 root.scale = spec.s 放大到 ~5 m。
+ * 每个子零件的 position 都写在**父零件的局部坐标**里，和手枪那三条规矩一致。 */
+function makeKaiju(type) {
+  const t = ENEMY_TYPES[type];
+  const spec = BODY_SPEC[type];
+  const root = new THREE.Group();
+  const body = new THREE.Group();
+  root.add(body);
+
+  // 每个敌人独立一份材质实例（命中白闪要单独控制），贴图本身共享
+  const M = {
+    scale: MAT.kaijuScale.clone(),
+    belly: MAT.kaijuBelly.clone(),
+    plate: MAT.kaijuPlate.clone(),
+    eye: new THREE.MeshStandardMaterial({ color: 0xffb03d, emissive: 0xff7a33, emissiveIntensity: 1.5, roughness: 0.3, metalness: 0.1 })
+  };
+
+  const put = (geo, mat, x, y, z, parent) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(x, y, z);
+    m.castShadow = true; m.receiveShadow = true;
+    (parent || body).add(m);
+    return m;
+  };
+
+  /* ---- 腿：枢轴在髋，脚底落在 y = 0；关节处刻意重叠 3~6cm，
+   *        否则 AABB 相交体积为 0，装配自检会把它当成"悬空零件" ---- */
+  const mkLeg = (side) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.36, 1.20, 0);
+    put(new THREE.BoxGeometry(0.32, 0.52, 0.36), M.scale, 0, -0.26, 0.00, pivot);          // 大腿：y 0 → -0.52
+    put(new THREE.BoxGeometry(0.26, 0.60, 0.32), M.scale, 0, -0.76, 0.06, pivot);          // 小腿：-1.06 → -0.46
+    put(new THREE.BoxGeometry(0.36, 0.18, 0.48), M.belly, 0, -1.12, 0.12, pivot);          // 脚掌：-1.21 → -1.03
+    for (const k of [-0.12, 0, 0.12]) put(new THREE.BoxGeometry(0.10, 0.10, 0.22), M.plate, k, -1.12, 0.42, pivot); // 趾
+    body.add(pivot);
+    return pivot;
+  };
+  const legL = mkLeg(1), legR = mkLeg(-1);
+
+  /* ---- 髋 / 躯干 / 胸板 ---- */
+  const hips  = put(roundedBox(0.66, 0.42, 0.50, 0.06), M.scale, 0, 1.34, -0.10);
+  const torso = put(roundedBox(0.80, 0.86, 1.02, 0.07), M.scale, 0, 1.92, 0.02);   // 命中体
+  put(roundedBox(0.64, 0.46, 0.28, 0.05), M.belly, 0, 1.80, 0.44);                 // 浅色胸板
+
+  /* ---- 尾巴：逐段枢轴，后段的坐标写在**上一段的局部系**里 ---- */
+  const tail = [];
+  let tailParent = body, tailY = 1.30, tailZ = -0.32;
+  for (const [w, h, len] of [[0.46, 0.44, 0.60], [0.34, 0.32, 0.52], [0.24, 0.22, 0.46], [0.16, 0.14, 0.40]]) {
+    const pivot = new THREE.Group();
+    pivot.position.set(0, tailY, tailZ);
+    put(roundedBox(w, h, len, 0.04), M.scale, 0, 0, -len / 2, pivot);
+    tailParent.add(pivot);
+    tail.push(pivot);
+    tailParent = pivot;
+    tailY = -0.05;            // 越往后越低一点，尾巴自然下垂
+    tailZ = -len + 0.06;      // 下一段的枢轴略微**嵌进**当前段，关节才有重叠体积
+  }
+
+  /* ---- 颈 / 头（爆头命中体） ---- */
+  const neck = put(roundedBox(0.42, 0.34, 0.46, 0.05), M.scale, 0, 2.36, 0.16);
+  const head = put(roundedBox(0.58, 0.48, 0.70, 0.06), M.scale, 0, 2.66, 0.30);
+  const snout = put(roundedBox(0.42, 0.30, 0.46, 0.05), M.scale, 0, -0.04, 0.46, head);
+  put(roundedBox(0.54, 0.10, 0.22, 0.03), M.scale, 0, 0.17, 0.28, head);           // 眉骨
+  const jawPivot = new THREE.Group();
+  jawPivot.position.set(0, -0.19, 0.18);
+  put(roundedBox(0.40, 0.16, 0.52, 0.04), M.belly, 0, -0.02, 0.28, jawPivot);
+  head.add(jawPivot);
+  for (const z of [0.26, 0.40, 0.54]) {
+    for (const x of [0.14, -0.14]) {
+      const tooth = put(new THREE.ConeGeometry(0.032, 0.10, 5), M.plate, x, -0.20, z, head);
+      tooth.rotation.x = Math.PI;                                 // 锥形默认朝 +Y，牙齿朝下
+    }
+  }
+  for (const z of [0.20, 0.34, 0.48]) {
+    for (const x of [0.11, -0.11]) put(new THREE.ConeGeometry(0.026, 0.08, 5), M.plate, x, 0.06, z, jawPivot);
+  }
+  for (const s of [1, -1]) {
+    const eye = put(new THREE.SphereGeometry(0.075, 10, 8), M.eye, s * 0.23, 0.10, 0.30, head);
+    addGlow(eye, 0xff7a33, 0.34, 0.7);
+    put(new THREE.BoxGeometry(0.07, 0.05, 0.08), M.scale, s * 0.13, 0.02, 0.66, head);   // 鼻孔
+  }
+  // 原子吐息的蓄能球：只在蓄力时出现，从嘴里亮出来
+  const breath = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 10),
+    new THREE.MeshBasicMaterial({ color: 0x4fd8ff, transparent: true, opacity: 0.9, toneMapped: false }));
+  breath.position.set(0, -0.12, 0.42);
+  breath.visible = false;
+  head.add(breath);
+  const breathGlow = addGlow(breath, 0x4fd8ff, 1.3, 0.9);
+
+  /* ---- 背板：颈后到尾根一路缩小。前几块贴在躯干上，后几块挂在**尾巴枢轴**上，
+   *      这样尾巴摆动时背板跟着走，而不是悬在半空。 ---- */
+  const spines = [];
+  for (const [z, h] of [[0.42, 0.60], [0.14, 0.50], [-0.14, 0.42]]) {
+    const p = put(new THREE.ConeGeometry(h * 0.30, h, 6), M.plate, 0, 2.35 + h * 0.47, z);
+    p.scale.set(0.5, 1, 0.34);                                    // 压扁成"板"，而不是圆锥
+    spines.push(p);
+  }
+  const segH = [0.44, 0.32, 0.22], segLen = [0.60, 0.52, 0.46];
+  for (let i = 0; i < 3; i++) {
+    const h = 0.34 - i * 0.08;
+    const p = put(new THREE.ConeGeometry(h * 0.30, h, 6), M.plate, 0, segH[i] / 2 + h / 2 - 0.03, -segLen[i] / 2, tail[i]);
+    p.scale.set(0.5, 1, 0.34);
+    spines.push(p);
+  }
+
+  /* ---- 短前肢 + 爪 ---- */
+  const mkArm = (side) => {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.48, 2.04, 0.30);
+    put(new THREE.BoxGeometry(0.20, 0.34, 0.22), M.scale, 0, -0.17, 0, pivot);
+    put(new THREE.BoxGeometry(0.16, 0.30, 0.18), M.scale, 0, -0.48, 0.04, pivot);
+    for (const k of [-0.06, 0, 0.06]) {
+      const claw = put(new THREE.ConeGeometry(0.035, 0.14, 5), M.plate, k, -0.68, 0.08, pivot);
+      claw.rotation.x = Math.PI * 0.86;                           // 爪朝下往前
+    }
+    body.add(pivot);
+    return pivot;
+  };
+  const armL = mkArm(1), armR = mkArm(-1);
+
+  // 轮廓光：暗背景里远距离也能看出体型（和首领同一招）
+  const rimMat = new THREE.MeshBasicMaterial({
+    color: t.color, transparent: true, opacity: 0.42, side: THREE.BackSide,
+    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
+  });
+  const mkRim = (src, scale) => {
+    const r = new THREE.Mesh(src.geometry, rimMat);
+    r.scale.setScalar(scale);
+    r.position.copy(src.position);
+    r.quaternion.copy(src.quaternion);
+    r.renderOrder = -1;
+    src.parent.add(r);
+    return r;
+  };
+  mkRim(torso, 1.06);
+  mkRim(head, 1.09);
+
+  const glow = addGlow(body, t.color, 2.4, 0.5);
+  glow.position.set(0, 1.9, 0);
+
+  root.scale.setScalar(spec.s);
+  return { root, body, torso, head, hips, neck, snout, jaw: jawPivot, breath, breathGlow,
+           spines, tail, armL, armR, legL, legR, glow, spec, mats: M, rimMat, top: 2.95 * spec.s };
+}
+
+function spawnEnemy(type, x, z) {
+  if (typeof x !== 'number') { const p = spawnPoint(); x = p.x; z = p.z; }
+  const t = ENEMY_TYPES[type];
+  const hp = t.hp * (type === 'boss' ? 1 : 1 + (wave - 1) * 0.08);
+  const hm = type === 'kaiju' ? makeKaiju(type) : makeHumanoid(type);
+  const mesh = hm.root;
+  mesh.position.set(x, 0, z);
+  scene.add(mesh);
+  const e = {
+    type, x, z, y: 1.1 * hm.spec.s, vy: 0, vx: 0, vz: 0, r: t.r * hm.spec.s, hp, maxHp: hp,
+    speed: t.speed * (type === 'boss' ? 1 : 1 + Math.min(0.55, (wave - 1) * 0.03)),
+    color: t.color, score: t.score, melee: t.melee, mesh, hm,
+    shotCd: rand(0.8, 2.2), atkCd: 0, flash: 0, dead: false, swing: 0,
+    throwCd: rand(1.2, 2.8), throwAnim: 0,
+    breathCd: rand(3.0, 6.0), chargeT: 0, tailCd: 0, top: hm.top || 1.8 * hm.spec.s,
+    phase: rand(0, TAU), summonCd: 6, wander: rand(0, TAU), bar: null
+  };
+  // 血条（面向相机的面片）
+  if (type !== 'boss') {
+    const bw = type === 'kaiju' ? 2.2 : 1.1;
+    const bar = new THREE.Group();
+    const bg = new THREE.Mesh(new THREE.PlaneGeometry(bw, 0.11),
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.65, depthWrite: false, toneMapped: false }));
+    const fill = new THREE.Mesh(new THREE.PlaneGeometry(bw, 0.09),
+      new THREE.MeshBasicMaterial({ color: t.color, depthWrite: false, toneMapped: false }));
+    fill.position.z = 0.01;
+    bar.add(bg, fill); bar.visible = false;
+    scene.add(bar);
+    e.bar = { group: bar, fill, w: bw };
+  }
+  enemies.push(e);
+  // 躯干 + 头 都是命中体：命中头 = 爆头（双倍伤害）
+  hm.torso.userData.enemy = e;
+  hm.head.userData.enemy = e;
+  hm.head.userData.headshot = true;
+  hitTargets.push(hm.torso, hm.head);
+  return e;
+}
+function spawnPoint() {
+  const side = randI(0, 3);
+  const m = ARENA - 2;
+  if (side === 0) return { x: rand(-m, m), z: -m };
+  if (side === 1) return { x: rand(-m, m), z: m };
+  if (side === 2) return { x: -m, z: rand(-m, m) };
+  return { x: m, z: rand(-m, m) };
+}
+
+/* ============================================================
+   5. 弹道 / 曳光 / 粒子
+   ============================================================ */
+let tracers = [];   // 玩家曳光
+let shocks = [];    // 爆炸冲击环
+const tracerPool = [];
+function getTracer() {
+  let m = tracerPool.pop();
+  if (!m) {
+    m = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.018, 0.018, 1, 5),
+      new THREE.MeshBasicMaterial({ color: 0x35e6ff, transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false })
+    );
+    m.geometry.translate(0, 0.5, 0);  // 原点移到一端，便于按长度缩放
+  }
+  m.visible = true;
+  return m;
+}
+const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _dir = new THREE.Vector3(), _up = new THREE.Vector3(0, 1, 0);
+function spawnTracer(from, to) {
+  const m = getTracer();
+  const len = from.distanceTo(to);
+  m.position.copy(from);
+  _dir.copy(to).sub(from).normalize();
+  m.quaternion.setFromUnitVectors(_up, _dir);
+  m.scale.set(1, len, 1);
+  scene.add(m);
+  tracers.push({ mesh: m, life: 0.055 });
+}
+const P_MAX = 600;
+let particles, pGeo, pPos, pCol;
+const pState = [];
+function initParticles() {
+  pPos = new Float32Array(P_MAX * 3);
+  pCol = new Float32Array(P_MAX * 3);
+  pGeo = new THREE.BufferGeometry();
+  pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
+  particles = new THREE.Points(pGeo, new THREE.PointsMaterial({
+    size: 0.17, map: glowTex, vertexColors: true, transparent: true,
+    blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true
+  }));
+  particles.frustumCulled = false;
+  scene.add(particles);
+}
+function burst(x, y, z, color, n, speed, size) {
+  const c = new THREE.Color(color);
+  for (let i = 0; i < n; i++) {
+    if (pState.length >= P_MAX) pState.shift();
+    const a = rand(0, TAU), e = rand(-0.3, 1), s = rand(speed * 0.3, speed);
+    pState.push({ x, y, z, vx: Math.cos(a) * s, vy: e * s, vz: Math.sin(a) * s, life: rand(0.2, 0.5), max: 0.5, c, size });
+  }
+}
+function updateParticles(dt) {
+  let n = 0;
+  for (let i = pState.length - 1; i >= 0; i--) {
+    const p = pState[i];
+    p.life -= dt;
+    if (p.life <= 0) { pState.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    p.vy -= 11 * dt; p.vx *= 0.92; p.vz *= 0.92;
+    if (p.y < 0.03) { p.y = 0.03; p.vy *= -0.35; p.vx *= 0.7; p.vz *= 0.7; }
+    const k = clamp(p.life / p.max, 0, 1);
+    pPos[n * 3] = p.x; pPos[n * 3 + 1] = p.y; pPos[n * 3 + 2] = p.z;
+    pCol[n * 3] = p.c.r * k; pCol[n * 3 + 1] = p.c.g * k; pCol[n * 3 + 2] = p.c.b * k;
+    n++;
+  }
+  for (let i = n; i < P_MAX; i++) { pCol[i * 3] = pCol[i * 3 + 1] = pCol[i * 3 + 2] = 0; }
+  pGeo.attributes.position.needsUpdate = true;
+  pGeo.attributes.color.needsUpdate = true;
+}
+function updateTracers(dt) {
+  for (let i = tracers.length - 1; i >= 0; i--) {
+    const t = tracers[i];
+    t.life -= dt;
+    t.mesh.material.opacity = clamp(t.life / 0.055, 0, 1);
+    if (t.life <= 0) {
+      scene.remove(t.mesh); t.mesh.visible = false; tracerPool.push(t.mesh);
+      tracers.splice(i, 1);
+    }
+  }
+}
+/** 爆炸冲击环：扩散 + 淡出 */
+function updateShocks(dt) {
+  for (let i = shocks.length - 1; i >= 0; i--) {
+    const s = shocks[i];
+    s.life -= dt;
+    const k = clamp(s.life / 0.35, 0, 1);
+    s.mesh.scale.setScalar(1 + (1 - k) * 3.2);
+    s.mesh.material.opacity = k * 0.85;
+    if (s.life <= 0) {
+      scene.remove(s.mesh);
+      s.mesh.geometry.dispose(); s.mesh.material.dispose();
+      shocks.splice(i, 1);
+    }
+  }
+}
+
+/* ============================================================
+   6. 音频
+   ============================================================ */
+let actx = null, muted = false;
+function audioInit() {
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    actx = new AC();
+  }
+  if (actx.state === 'suspended') actx.resume();
+}
+function tone(freq, dur, type = 'square', vol = 0.05, slide = 0, delay = 0) {
+  if (!actx || muted) return;
+  const t0 = actx.currentTime + delay;
+  const osc = actx.createOscillator();
+  const g = actx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t0);
+  if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0 + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g); g.connect(actx.destination);
+  osc.start(t0); osc.stop(t0 + dur + 0.02);
+}
+function noise(dur, vol = 0.06, filterFreq = 900) {
+  if (!actx || muted) return;
+  const n = Math.floor(actx.sampleRate * dur);
+  const buf = actx.createBuffer(1, n, actx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const f = actx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = filterFreq;
+  const g = actx.createGain(); g.gain.value = vol;
+  src.connect(f); f.connect(g); g.connect(actx.destination);
+  src.start();
+}
+const SFX = {
+  // 枪声：低频"砰" + 高频"嘶"
+  shoot:  () => { noise(0.09, 0.075, 3400); tone(140, 0.09, 'sine', 0.075, -70); tone(900, 0.04, 'square', 0.02, -500); },
+  gatling:() => { noise(0.05, 0.05, 2600); tone(180, 0.05, 'square', 0.03, -90); },
+  throw:  () => { tone(300, 0.12, 'triangle', 0.03, 260); },
+  boom:   () => { noise(0.3, 0.09, 900); tone(90, 0.28, 'sine', 0.08, -50); },
+  hit:    () => tone(520, 0.045, 'triangle', 0.04, -220),
+  kill:   () => { tone(220, 0.16, 'sawtooth', 0.05, -140); noise(0.2, 0.05, 800); },
+  boss:   () => { tone(80, 0.6, 'sawtooth', 0.08, -30); noise(0.6, 0.07, 450); },
+  roar:   () => { tone(64, 0.9, 'sawtooth', 0.11, -24); tone(150, 0.6, 'square', 0.05, 60, 0.12); noise(0.7, 0.09, 520); },
+  breath: () => { tone(360, 0.6, 'sawtooth', 0.08, 1100); tone(80, 0.6, 'sine', 0.10, -18); noise(0.5, 0.07, 2600); },
+  hurt:   () => { tone(190, 0.2, 'sawtooth', 0.08, -110); noise(0.15, 0.06, 420); },
+  reload: () => { tone(240, 0.05, 'square', 0.035); tone(340, 0.05, 'square', 0.035, 0, 0.14); tone(520, 0.07, 'square', 0.03, 0, 0.3); },
+  pickup: () => { tone(700, 0.07, 'triangle', 0.05); tone(1050, 0.1, 'triangle', 0.05, 0, 0.07); },
+  empty:  () => tone(160, 0.05, 'square', 0.035),
+  wave:   () => { tone(300, 0.12, 'triangle', 0.05); tone(450, 0.12, 'triangle', 0.05, 0, 0.1); tone(600, 0.22, 'triangle', 0.05, 0, 0.2); },
+  over:   () => { tone(300, 0.5, 'sawtooth', 0.07, -180); tone(140, 0.8, 'sine', 0.06, -60, 0.15); }
+};
+
+/* ============================================================
+   7. 玩家控制器
+   ============================================================ */
+function turnBy(rx, ry) {
+  player.yaw -= rx;
+  player.pitch = clamp(player.pitch - ry, -1.45, 1.45);
+}
+function applyLook(dx, dy) {
+  turnBy(dx * SENS, dy * SENS);
+  player.swayX = clamp(player.swayX - dx * 0.0016, -0.06, 0.06);
+  player.swayY = clamp(player.swayY - dy * 0.0016, -0.05, 0.05);
+}
+/**
+ * 自由模式（指针锁定不可用时）：光标相对位移转头，手感与锁定模式一致 —— 鼠标停，视角就停。
+ * 光标推到窗口边缘时持续朝该方向转身，避免"转到一半卡在边缘"。
+ */
+function updateFreeLook(dt) {
+  if (mouse.locked || lastX === null) return;
+  const W = innerWidth, H = innerHeight, EDGE = 4;
+  let rx = 0, ry = 0;
+  if (lastX >= W - EDGE && edgeDX > 0) rx = 1;
+  else if (lastX <= EDGE && edgeDX < 0) rx = -1;
+  if (lastY >= H - EDGE && edgeDY > 0) ry = 1;
+  else if (lastY <= EDGE && edgeDY < 0) ry = -1;
+  if (rx || ry) turnBy(rx * TURN_RATE * dt, ry * TURN_RATE * dt);
+}
+function movePlayer(dt) {
+  // 目标速度
+  let f = 0, s = 0;
+  if (keys['w'] || keys['arrowup']) f += 1;
+  if (keys['s'] || keys['arrowdown']) f -= 1;
+  if (keys['a'] || keys['arrowleft']) s -= 1;
+  if (keys['d'] || keys['arrowright']) s += 1;
+  const sprint = (keys['shift'] || keys['shiftleft']) && f > 0;
+  const speed = sprint ? SPRINT : WALK;
+
+  camera.getWorldDirection(_dir);
+  _dir.y = 0; _dir.normalize();
+  const rx = -_dir.z, rz = _dir.x;          // 右向量（水平）
+  let mx = _dir.x * f + rx * s;
+  let mz = _dir.z * f + rz * s;
+  const ml = Math.hypot(mx, mz);
+  if (ml > 0.001) { mx /= ml; mz /= ml; }
+
+  const tx = mx * speed, tz = mz * speed;
+  const k = ml > 0.001 ? ACCEL : FRICTION;
+  player.vx += (tx - player.vx) * Math.min(1, k * dt);
+  player.vz += (tz - player.vz) * Math.min(1, k * dt);
+  player.x += player.vx * dt;
+  player.z += player.vz * dt;
+
+  // 竖直（跳跃 / 重力）
+  if (keys[' '] && player.grounded) { player.vy = JUMP_V; player.grounded = false; }
+  player.vy -= GRAVITY * dt;
+  player.y += player.vy * dt;
+  if (player.y <= EYE_H) { player.y = EYE_H; player.vy = 0; player.grounded = true; }
+
+  // 碰撞：圆柱 vs AABB（XZ 平面）
+  for (const o of obstacles) {
+    const nx = clamp(player.x, o.x, o.x + o.w), nz = clamp(player.z, o.z, o.z + o.d);
+    let dx = player.x - nx, dz = player.z - nz;
+    const d = Math.hypot(dx, dz);
+    if (d > 0 && d < P_R) {
+      const push = (P_R - d);
+      player.x += (dx / d) * push;
+      player.z += (dz / d) * push;
+      player.vx *= 0.5; player.vz *= 0.5;
+    } else if (d === 0) {
+      // 圆心在箱体内：推向最近边
+      const l = player.x - o.x, rr = o.x + o.w - player.x, t = player.z - o.z, b = o.z + o.d - player.z;
+      const m = Math.min(l, rr, t, b);
+      if (m === l) player.x = o.x - P_R;
+      else if (m === rr) player.x = o.x + o.w + P_R;
+      else if (m === t) player.z = o.z - P_R;
+      else player.z = o.z + o.d + P_R;
+    }
+  }
+  // 场地边界
+  const lim = ARENA - P_R - 0.6;
+  player.x = clamp(player.x, -lim, lim);
+  player.z = clamp(player.z, -lim, lim);
+
+  // 走路摆动
+  const spd = Math.hypot(player.vx, player.vz);
+  player.bob += dt * spd * 1.5;
+  player.dashCd = Math.max(0, player.dashCd - dt);
+  player.inv = Math.max(0, player.inv - dt);
+  player.rapid = Math.max(0, player.rapid - dt);
+  // 散布回落：**按当前散布的比例衰减**（指数衰减，时间常数 1/0.8 ≈ 1.25s）。
+  // 之前是固定 0.55/秒 —— 加特林每秒才攒 0.072，根本追不上衰减，
+  // "连射散布扩大"等于没有；固定值还有个副作用：低射速武器永远攒不起来。
+  // 比例衰减的好处是"攒得越多、掉得越快"，天然形成平衡点：
+  //   加特林每发 +0.006、20 发/秒 = 0.12/s，平衡点 0.15 rad > 上限 0.054 → 约 0.6 秒吃满
+  //   手枪  每发 +0.002、9 发/秒  = 0.018/s，平衡点 0.0225 rad > 上限 0.018 → 约 1.5 秒吃满
+  player.spreadHeat = Math.max(0, player.spreadHeat - dt * player.spreadHeat * 0.8);
+  // 枪口上跳回收：不让准星持续往上飘
+  if (player.recoilPitch > 0) {
+    const back = Math.min(player.recoilPitch, RECOIL_RECOVER * dt);
+    player.pitch = clamp(player.pitch - back, -1.45, 1.45);
+    player.recoilPitch -= back;
+  }
+  if (player.comboT > 0) { player.comboT -= dt; if (player.comboT <= 0) player.combo = 0; }
+
+  camera.position.set(player.x, player.y, player.z);
+  camera.rotation.set(player.pitch, player.yaw, 0);
+}
+
+/* ============================================================
+   8. 射击
+   ============================================================ */
+function tryFire() {
+  if (state !== 'playing') return;
+  const w = WEAPONS[player.weapon];
+  if (player.reloadT > 0) return;
+  if (player.fireCd > 0) return;
+  if (player.mag <= 0) { SFX.empty(); player.fireCd = 0.25; return; }
+  player.mag--;
+  player.fireCd = w.fireCd;
+  // 散布随连射扩大（加特林尤其明显），停火后回落
+  // 上限 = heat * 0.18：加特林连射到底也就 ~4.8° 的锥角（10m 处约 84cm 弹着圈）。
+  // 原来的 heat * 3.4 会涨到 1.02 rad ≈ 58°，那不是散布，那是狙击步枪配了霰弹。
+  // 每发 +heat*0.020：加特林约 0.6 秒（11 发）吃满，手枪约 1.5 秒吃满。
+  player.spreadHeat = Math.min(w.heat * 0.18, player.spreadHeat + w.heat * 0.020);
+  recoilSpring = Math.min(1, recoilSpring + (w.id === 'gatling' ? 0.3 : 0.55));
+  player.recoil = Math.min(0.09, player.recoil + (w.id === 'gatling' ? 0.014 : 0.028));
+  player.pitch = clamp(player.pitch + w.recoil, -1.45, 1.45);   // 枪口上跳
+  player.recoilPitch = Math.min(0.22, (player.recoilPitch || 0) + w.recoil);
+  shake = Math.max(shake, w.id === 'gatling' ? 0.22 : 0.35);
+  muzzleFlash.material.opacity = 1;
+  muzzleFlash.scale.setScalar(rand(0.7, 1.0) * (w.id === 'gatling' ? 0.85 : 1));
+  player.spin = 1;                         // 加特林枪管加速
+  SFX[w.sfx]();
+
+  // 射线：从屏幕中心
+  scene.updateMatrixWorld();
+  // 散布：把射线在一个锥角内随机偏开。
+  // 之前 w.spread / player.spreadHeat 算了却**从没作用到射线上**，
+  // 结果加特林每一发都精确命中屏幕正中的那一个点，射起来毫无技术含量。
+  const spread = w.spread + player.spreadHeat;
+  if (spread > 0) {
+    // 相机正前方方向
+    camera.getWorldDirection(_sdir);
+    // 以相机上方向为基准，构造切平面上的两条正交轴
+    _sright.crossVectors(_sdir, camera.up);
+    if (_sright.lengthSq() < 1e-6) _sright.set(1, 0, 0);
+    _sright.normalize();
+    _sup.crossVectors(_sright, _sdir).normalize();
+    // 在圆锥内均匀取点（半径 sqrt(u) 保证圆盘上密度均匀）
+    const r = Math.sqrt(Math.random()) * Math.tan(spread);
+    const th = Math.random() * TAU;
+    _sdir.addScaledVector(_sright, Math.cos(th) * r)
+         .addScaledVector(_sup, Math.sin(th) * r)
+         .normalize();
+    raycaster.set(camera.position, _sdir);
+  } else {
+    raycaster.setFromCamera({ x: 0, y: 0 }, camera);
+  }
+  raycaster.far = 120;
+  // 命中体 + 掩体一起测：取最近的那个。
+  // 少了掩体这一项，掩体后面的敌人照样能被打死（子弹穿墙），
+  // 而敌人的子弹却会被掩体挡下 —— 双方规则不一致。
+  const hits = raycaster.intersectObjects(hitTargets.concat(coverMeshes), false);
+
+  const muzzle = new THREE.Vector3(0, 0, w.id === 'gatling' ? -1.0 : -0.9);
+  gun.localToWorld(muzzle);
+  const end = new THREE.Vector3();
+  if (hits.length > 0) {
+    const h = hits[0];
+    end.copy(h.point);
+    const e = h.object.userData.enemy;
+    if (e) {
+      const headshot = !!h.object.userData.headshot;
+      const dmg = w.dmg * (headshot ? 2 : 1);
+      e.hp -= dmg;
+      e.flash = 0.12;
+      hitFlash = 0.14;
+      burst(h.point.x, h.point.y, h.point.z, headshot ? 0xff9ec4 : 0xfff2b0, headshot ? 12 : 7, headshot ? 7 : 4.5, 0.2);
+      if (headshot) { shake = Math.max(shake, 1.2); SFX.kill(); } else SFX.hit();
+      if (e.hp <= 0) killEnemy(e);
+    } else if (coverMeshes.includes(h.object)) {
+      // 打在掩体上：只出火花，不造成伤害（掩体后的敌人因此受保护）
+      burst(h.point.x, h.point.y, h.point.z, 0xffc857, 5, 3.4, 0.18);
+      SFX.hit();
+    } else {
+      burst(h.point.x, h.point.y, h.point.z, 0x8fa0d8, 5, 3, 0.18);
+    }
+  } else {
+    raycaster.ray.at(90, end);
+  }
+  spawnTracer(muzzle, end);
+}
+function killEnemy(e) {
+  e.dead = true;
+  kills++;
+  player.combo++;
+  player.comboT = 2.2;
+  bestCombo = Math.max(bestCombo, player.combo);
+  const mult = 1 + Math.min(2, Math.floor(player.combo / 5) * 0.25);
+  const gain = Math.round(e.score * mult);
+  player.score += gain;
+  hitFlash = 0.2;
+  el.hitmark.classList.add('kill');
+  burst(e.x, e.y, e.z, e.color, e.type === 'boss' ? 70 : 24, e.type === 'boss' ? 11 : 6, 0.3);
+  shake = Math.max(shake, e.type === 'boss' ? 4 : 0.9);
+  SFX.kill();
+
+  const r = Math.random();
+  if (e.type !== 'boss') {
+    if (r < 0.13) spawnPickup(e.x, e.z, 'health');
+    else if (r < 0.26) spawnPickup(e.x, e.z, 'ammo');
+    else if (r < 0.31) spawnPickup(e.x, e.z, 'rapid');
+  } else {
+    spawnPickup(e.x, e.z, 'health');
+    spawnPickup(e.x + 1.4, e.z, 'rapid');
+  }
+  if (e.bar) scene.remove(e.bar.group);
+  scene.remove(e.mesh);
+  const i = enemies.indexOf(e);
+  if (i >= 0) enemies.splice(i, 1);
+  // 移除命中体（躯干 + 头）
+  for (const m of [e.hm.torso, e.hm.head]) {
+    const hi = hitTargets.indexOf(m);
+    if (hi >= 0) hitTargets.splice(hi, 1);
+  }
+}
+
+/* ============================================================
+   9. 敌人 AI
+   ============================================================ */
+/* ---------- 敌方远程攻击：射击（直线弹丸） + 投掷（抛物线爆炸物） ---------- */
+const PROJ_G = 16;                 // 投掷物的重力
+/** 射击：高速直线弹丸，能被掩体挡下 */
+function fireBullets(e, count, spread, speed, offset = 0, dmg = 9) {
+  const base = Math.atan2(player.z - e.z, player.x - e.x) + offset;
+  // 开火枪口闪光（让玩家看得见敌人正在射击）
+  const flash = addGlow(scene, 0xff3d7f, 1.5, 0.95);
+  flash.position.set(e.x + Math.cos(base) * (e.r + 0.5), e.y, e.z + Math.sin(base) * (e.r + 0.5));
+  flashes.push({ s: flash, t: 0.09 });
+  for (let i = 0; i < count; i++) {
+    const a = base + (count === 1 ? 0 : (i - (count - 1) / 2) * spread);
+    const mesh = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.05, 0.05, 0.55, 6),
+      new THREE.MeshBasicMaterial({ color: 0xff3d7f, toneMapped: false })
+    );
+    mesh.geometry.rotateX(Math.PI / 2);   // 长轴沿 +Z
+    const gl = addGlow(mesh, 0xff3d7f, 1.0, 0.9);
+    const x = e.x + Math.cos(a) * (e.r + 0.4), z = e.z + Math.sin(a) * (e.r + 0.4);
+    mesh.position.set(x, e.y, z);
+    mesh.lookAt(x + Math.cos(a) * 10, e.y, z + Math.sin(a) * 10);
+    scene.add(mesh);
+    bullets.push({
+      kind: 'bullet', x, y: e.y, z,
+      vx: Math.cos(a) * speed, vy: 0, vz: Math.sin(a) * speed,
+      r: 0.16, dmg, life: 3.4, mesh, glow: gl, spin: 0
+    });
+    projLog.push({ kind: 'bullet', x, z, y: e.y, vy: 0, speed, t: performance.now() });
+  }
+}
+/** 投掷：抛物线飞行的能量块，落地后范围爆炸 */
+function throwObject(e, speed, radius, dmg, color = 0xffb03d) {
+  const dx = player.x - e.x, dz = player.z - e.z;
+  const d = Math.hypot(dx, dz) || 1;
+  const t = clamp(d / speed, 0.35, 1.8);
+  const x0 = e.x + (dx / d) * (e.r + 0.5);
+  const z0 = e.z + (dz / d) * (e.r + 0.5);
+  const y0 = e.y + e.r * 1.5;                       // 从手心高度抛出
+  const vy = (player.y - y0) / t + 0.5 * PROJ_G * t; // 抛物线初速
+  const mesh = new THREE.Mesh(new THREE.OctahedronGeometry(0.24, 0), neonMat(0xffffff, color, 1.8));
+  const gl = addGlow(mesh, color, 1.5, 0.95);
+  mesh.position.set(x0, y0, z0);
+  scene.add(mesh);
+  bullets.push({
+    kind: 'thrown', x: x0, y: y0, z: z0,
+    vx: (dx / d) * speed, vy, vz: (dz / d) * speed,
+    r: 0.3, dmg, life: 6, mesh, glow: gl, spin: rand(5, 10), radius, color
+  });
+  e.throwAnim = 1;                                   // 抬手投掷的动画
+  projLog.push({ kind: 'thrown', x: x0, z: z0, y: y0, vy, radius, t: performance.now() });
+  SFX.throw();
+}
+/** 巨兽的原子吐息：从嘴里沿直线射出的高能束，会被掩体挡下，命中玩家伤害很高 */
+function fireBreath(e) {
+  const mouth = e.hm.head.getWorldPosition(new THREE.Vector3());
+  const dx = player.x - mouth.x, dz = player.z - mouth.z;
+  const d = Math.hypot(dx, dz) || 1;
+  const speed = 26;
+  const t = clamp(d / speed, 0.2, 1.6);
+  const vy = (player.y - mouth.y) / t;            // 略微俯射，让束线落到玩家高度
+  const mesh = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.16, 0.34, 1.6, 10, 1, true),
+    neonMat(0xffffff, 0x4fd8ff, 2.6)
+  );
+  mesh.geometry.rotateX(Math.PI / 2);             // 长轴沿 +Z，和 lookAt 的朝向一致
+  const gl = addGlow(mesh, 0x4fd8ff, 1.7, 0.95);
+  mesh.position.set(mouth.x, mouth.y, mouth.z);
+  mesh.lookAt(player.x, player.y, player.z);
+  scene.add(mesh);
+  bullets.push({
+    kind: 'breath', x: mouth.x, y: mouth.y, z: mouth.z,
+    vx: (dx / d) * speed, vy, vz: (dz / d) * speed,
+    r: 0.55, dmg: 26, life: 2.2, mesh, glow: gl, spin: 0, color: 0x4fd8ff
+  });
+  projLog.push({ kind: 'breath', x: mouth.x, z: mouth.z, y: mouth.y, vy, speed, t: performance.now() });
+  SFX.breath();
+  shake = Math.max(shake, 1.4);
+}
+/** 巨兽动画：四足行走 + 尾巴逐段摆动 + 撕咬 / 吐息蓄能 */
+function animateKaiju(e, dt, sp) {
+  const hm = e.hm;
+  const moveK = clamp(sp / Math.max(0.001, e.speed), 0, 1.6);
+  const ph = e.phase * hm.spec.walk * (0.35 + moveK * 0.8);
+  const stride = 0.42 * (0.3 + moveK * 0.9);
+  hm.legL.rotation.x = Math.sin(ph) * stride;
+  hm.legR.rotation.x = Math.sin(ph + Math.PI) * stride;
+  hm.armL.rotation.x = Math.sin(ph + Math.PI) * stride * 0.6 - 0.28;
+  hm.armR.rotation.x = Math.sin(ph) * stride * 0.6 - 0.28;
+  hm.armL.rotation.z = 0.18; hm.armR.rotation.z = -0.18;
+  hm.body.position.y = Math.abs(Math.sin(ph)) * 0.05;
+  hm.body.rotation.x = -0.13;                       // 巨兽惯用的前倾姿态
+  // 尾巴：每段继承上一段的摆动，越靠尾尖摆幅越大
+  for (let i = 0; i < hm.tail.length; i++) {
+    hm.tail[i].rotation.y = Math.sin(ph * 0.8 + i * 0.7) * 0.13 * (1 + i * 0.55);
+  }
+  // 撕咬：下颌张开 + 头往前压
+  if (e.swing > 0) {
+    e.swing = Math.max(0, e.swing - dt * 2.6);
+    const s = Math.sin(e.swing * Math.PI);
+    hm.jaw.rotation.x = 0.85 * s;
+    hm.head.rotation.x = 0.30 * s;
+    hm.armR.rotation.x = -1.5 * s;
+    hm.body.rotation.x += 0.16 * s;
+  }
+  // 吐息蓄能：嘴里的能量球逐渐亮、逐渐大
+  if (e.chargeT > 0) {
+    const k = clamp(1 - e.chargeT / 0.85, 0, 1);
+    hm.breath.visible = true;
+    hm.breath.scale.setScalar(0.35 + k * 1.15);
+    hm.breathGlow.scale.setScalar(1.0 + k * 1.6);
+    hm.jaw.rotation.x = Math.max(hm.jaw.rotation.x, 0.55 * k);
+  } else if (hm.breath.visible) {
+    hm.breath.visible = false;
+  }
+  if (hm.jaw.rotation.x > 0 && e.swing <= 0 && e.chargeT <= 0) {
+    hm.jaw.rotation.x = Math.max(0, hm.jaw.rotation.x - dt * 3.2);
+  }
+}
+
+function updateEnemies(dt) {
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+    if (e.dead) continue;
+    e.flash = Math.max(0, e.flash - dt);
+    e.phase += dt;
+    e.atkCd = Math.max(0, e.atkCd - dt);
+
+    const dx = player.x - e.x, dz = player.z - e.z;
+    const d = Math.hypot(dx, dz) || 1;
+    const nx = dx / d, nz = dz / d;
+    let tx = nx, tz = nz, sp = e.speed;
+
+    if (e.type === 'shooter') {
+      const want = 11;
+      const sign = Math.sin(e.phase * 0.9) > 0 ? 1 : -1;
+      if (d < want - 2) { tx = -nx; tz = -nz; }
+      else if (d > want + 2) { tx = nx; tz = nz; }
+      tx += -nz * sign * 0.8; tz += nx * sign * 0.8;
+    } else if (e.type === 'boss') {
+      const want = 14;
+      const sign = Math.sin(e.phase * 0.6) > 0 ? 1 : -1;
+      if (d < want - 3) { tx = -nx; tz = -nz; }
+      else if (d > want + 3) { tx = nx; tz = nz; }
+      tx += -nz * sign * 0.6; tz += nx * sign * 0.6;
+      e.shotCd -= dt;
+      if (e.shotCd <= 0) {
+        e.shotCd = 2.1;
+        fireBullets(e, 12, TAU / 11, 13);            // 环形弹幕
+        fireBullets(e, 3, 0.2, 17, rand(-0.3, 0.3)); // 瞄准散射
+      }
+      e.throwCd -= dt;
+      if (e.throwCd <= 0) {
+        e.throwCd = 3.4;
+        throwObject(e, 11, 2.6, 20, 0xff2f6d);       // 首领的燃烧弹
+      }
+      e.summonCd -= dt;
+      if (e.summonCd <= 0) {
+        e.summonCd = 7;
+        e.summons = (e.summons || 0) + 1;
+        // 疾行者已取消：首领的召唤改为冲锋兵，隔一次召一头巨兽
+        if (e.summons % 2 === 0) spawnEnemy('kaiju', e.x + rand(-4, 4), e.z + rand(-4, 4));
+        for (let k = 0; k < 2; k++) spawnEnemy('grunt', e.x + rand(-3, 3), e.z + rand(-3, 3));
+      }
+    } else if (e.type === 'tank') {
+      sp = e.speed * (Math.sin(e.phase * 1.3) > 0 ? 1.4 : 0.7);
+    } else if (e.type === 'kaiju') {
+      // 巨兽：大范围巡游 + 间歇性扑近；中距离原子吐息，贴身撕咬与尾巴横扫
+      e.wander += dt * 0.9;
+      tx += Math.cos(e.wander) * 0.28;
+      tz += Math.sin(e.wander) * 0.28;
+      sp = e.speed * (Math.sin(e.phase * 1.1) > 0.55 ? 1.55 : 0.72);
+
+      e.breathCd -= dt;
+      if (e.chargeT > 0) {
+        e.chargeT -= dt;
+        if (e.chargeT <= 0) fireBreath(e);
+      } else if (e.breathCd <= 0 && d > 4.5 && d < 20) {
+        e.breathCd = rand(5.0, 8.0);
+        e.chargeT = 0.85;                       // 先吼一声蓄能，再吐息
+        SFX.roar();
+        shake = Math.max(shake, 1.1);
+      }
+      e.tailCd = Math.max(0, e.tailCd - dt);
+      if (e.tailCd <= 0 && d < e.r + P_R + 1.2) {
+        e.tailCd = 2.4;
+        damagePlayer(14);
+        player.vx += nx * 7.5; player.vz += nz * 7.5;      // 横扫把玩家推开
+        burst(e.x + nx * 1.2, 0.7, e.z + nz * 1.2, 0x8fa06b, 16, 4.5, 0.3);
+        shake = Math.max(shake, 1.6);
+      }
+    } else if (e.type === 'grunt') {
+      e.wander += dt * 1.6;
+      tx += Math.cos(e.wander) * 0.22;
+      tz += Math.sin(e.wander) * 0.22;
+    }
+
+    const tl = Math.hypot(tx, tz) || 1;
+    tx /= tl; tz /= tl;
+    e.vx += (tx * sp - e.vx) * Math.min(1, 6 * dt);
+    e.vz += (tz * sp - e.vz) * Math.min(1, 6 * dt);
+    e.x += e.vx * dt; e.z += e.vz * dt;
+
+    // 撞墙：沿边缘滑行
+    for (const o of obstacles) {
+      const nx2 = clamp(e.x, o.x, o.x + o.w), nz2 = clamp(e.z, o.z, o.z + o.d);
+      let ax = e.x - nx2, az = e.z - nz2;
+      const ad = Math.hypot(ax, az);
+      if (ad > 0 && ad < e.r) {
+        const ang = Math.atan2(az, ax);
+        e.x += Math.cos(ang) * (e.r - ad);
+        e.z += Math.sin(ang) * (e.r - ad);
+        // 沿箱体切向绕行
+        const cx = o.x + o.w / 2, cz = o.z + o.d / 2;
+        const ra = Math.atan2(e.z - cz, e.x - cx);
+        const anx = Math.cos(ra), anz = Math.sin(ra);
+        const t1x = -anz, t1z = anx, t2x = anz, t2z = -anx;
+        const useT1 = (t1x * tx + t1z * tz) >= (t2x * tx + t2z * tz);
+        e.vx += (useT1 ? t1x : t2x) * e.speed * 1.6;
+        e.vz += (useT1 ? t1z : t2z) * e.speed * 1.6;
+      }
+    }
+    const lim = ARENA - e.r - 0.4;
+    e.x = clamp(e.x, -lim, lim);
+    e.z = clamp(e.z, -lim, lim);
+
+    // 敌人之间分离
+    for (const o of enemies) {
+      if (o === e || o.dead) continue;
+      const ddx = e.x - o.x, ddz = e.z - o.z;
+      const dd = Math.hypot(ddx, ddz), minD = e.r + o.r;
+      if (dd > 0.0001 && dd < minD) {
+        // 推力按体型分配：小怪推不动巨兽，巨兽也不会被一小群冲锋兵挤走
+        const w = o.r / (e.r + o.r);
+        const push = (minD - dd) * w;
+        e.x += (ddx / dd) * push; e.z += (ddz / dd) * push;
+      }
+    }
+
+    // 攻击
+    if (e.type === 'shooter') {
+      e.shotCd -= dt;
+      e.throwCd -= dt;
+      if (e.shotCd <= 0) {
+        e.shotCd = rand(1.1, 2.0);
+        fireBullets(e, 2, 0.12, 16);                 // 射击：两连发弹丸
+      }
+      if (e.throwCd <= 0) {
+        e.throwCd = rand(2.6, 4.0);
+        throwObject(e, 10, 2.0, 16, 0xc04dff);      // 投掷：会爆的能量块
+      }
+    }
+    if (e.type === 'tank') {
+      e.throwCd -= dt;
+      if (e.throwCd <= 0) {
+        e.throwCd = rand(3.0, 4.6);
+        throwObject(e, 8, 2.8, 22, 0x39d98a);        // 重装兵的迫击式投掷
+      }
+    }
+    if (d < e.r + P_R + 0.25 && e.atkCd <= 0) {
+      e.atkCd = e.type === 'kaiju' ? 1.1 : 0.85;
+      e.swing = 1;
+      damagePlayer(e.melee);
+      const a = Math.atan2(e.z - player.z, e.x - player.x);
+      const kb = e.type === 'kaiju' ? 8.5 : 5.5;          // 巨兽一口能把人撞飞
+      player.vx += Math.cos(a) * kb; player.vz += Math.sin(a) * kb;
+      if (e.type === 'kaiju') shake = Math.max(shake, 1.3);
+    }
+
+    // 模型：朝向玩家 + 动画
+    const m = e.mesh, hm = e.hm;
+    m.position.set(e.x, 0, e.z);
+    m.lookAt(player.x, 0, player.z);
+
+    if (e.type === 'kaiju') {
+      animateKaiju(e, dt, sp);
+    } else {
+      // 行走循环：腿/手臂交替摆动，速度越快步频越高
+      const moveK = clamp(sp / Math.max(0.001, e.speed), 0, 1.6);
+      const ph = e.phase * hm.spec.walk * (0.35 + moveK * 0.75);
+      const stride = 0.55 * (0.3 + moveK * 0.9);
+      hm.legL.rotation.x = Math.sin(ph) * stride;
+      hm.legR.rotation.x = Math.sin(ph + Math.PI) * stride;
+      hm.armL.rotation.x = Math.sin(ph + Math.PI) * stride * 0.8;
+      hm.armR.rotation.x = Math.sin(ph) * stride * 0.8;
+      hm.armL.rotation.z = 0.1; hm.armR.rotation.z = -0.1;
+      // 身体起伏 + 前倾
+      hm.body.position.y = Math.abs(Math.sin(ph)) * 0.045;
+      hm.body.rotation.x = e.type === 'tank' ? 0.08 : 0;
+      // 近战挥击
+      if (e.swing > 0) {
+        e.swing = Math.max(0, e.swing - dt * 3.2);
+        const s = Math.sin(e.swing * Math.PI);
+        hm.armR.rotation.x = -1.9 * s;
+        hm.body.rotation.x -= 0.25 * s;
+      }
+      // 投掷动作：手臂高举后甩出
+      if (e.throwAnim > 0) {
+        e.throwAnim = Math.max(0, e.throwAnim - dt * 1.5);
+        const s = Math.sin(e.throwAnim * Math.PI);
+        hm.armR.rotation.x = -2.7 * s;
+        hm.armR.rotation.z = -0.6 * s;
+        hm.body.rotation.x -= 0.2 * s;
+      }
+      if (hm.orb) {
+        hm.orb.rotation.x += dt * 2.4; hm.orb.rotation.y += dt * 1.7;
+        hm.orb.scale.setScalar(1 + Math.sin(e.phase * 6) * 0.12);
+      }
+      if (hm.body.userData.rings) {
+        hm.body.userData.rings[0].rotation.z += dt;
+        hm.body.userData.rings[1].rotation.x += dt * 0.8;
+      }
+    }
+    const core = hm.torso;
+    if (e.flash > 0) {
+      core.material.emissive.setHex(0xffffff);
+      core.material.emissiveIntensity = 1.8;
+    } else {
+      core.material.emissive.setHex(e.color);
+      core.material.emissiveIntensity = 0.12;   // 微弱霓虹底色，保证黑暗中可辨
+    }
+    hm.head.material.emissive.setHex(e.flash > 0 ? 0xffffff : e.color);
+    hm.head.material.emissiveIntensity = e.flash > 0 ? 1.8 : 0.08;
+
+    // 血条
+    if (e.bar) {
+      const show = e.hp < e.maxHp;
+      e.bar.group.visible = show;
+      if (show) {
+        e.bar.group.position.set(e.x, e.top + 0.35, e.z);
+        e.bar.group.lookAt(camera.position);
+        const k = clamp(e.hp / e.maxHp, 0, 1);
+        e.bar.fill.scale.x = Math.max(0.0001, k);
+        e.bar.fill.position.x = -e.bar.w * (1 - k) / 2;
+      }
+    }
+  }
+}
+
+/* ============================================================
+   10. 敌方投射物 / 拾取物
+   ============================================================ */
+/** 临时闪光（敌人开火枪口火光）衰减 */
+function updateFlashes(dt) {
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    f.t -= dt;
+    if (f.t <= 0) { scene.remove(f.s); flashes.splice(i, 1); continue; }
+    const k = f.t / 0.09;
+    f.s.material.opacity = 0.95 * k;
+    f.s.scale.setScalar(1.5 * (1.4 - k * 0.4));
+  }
+}
+function updateBullets(dt) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    // 投掷物走抛物线
+    if (b.kind === 'thrown') {
+      b.vy -= PROJ_G * dt;
+      b.y += b.vy * dt;
+      b.mesh.rotation.x += b.spin * dt;
+      b.mesh.rotation.z += b.spin * 0.6 * dt;
+    } else if (b.kind === 'breath') {
+      // 吐息沿直线前进（不受重力），能量束自身旋转
+      b.y += b.vy * dt;
+      b.mesh.rotation.z += 4 * dt;
+    }
+    b.x += b.vx * dt; b.z += b.vz * dt; b.life -= dt;
+    b.mesh.position.set(b.x, b.y, b.z);
+    b.glow.position.set(0, 0, 0);
+    let hit = b.life <= 0 || Math.abs(b.x) > ARENA + 2 || Math.abs(b.z) > ARENA + 2;
+    if (!hit) {
+      for (const o of obstacles) {
+        const nx = clamp(b.x, o.x, o.x + o.w), nz = clamp(b.z, o.z, o.z + o.d);
+        if (Math.hypot(b.x - nx, b.z - nz) < b.r) { hit = true; break; }
+      }
+    }
+    const pd = Math.hypot(b.x - player.x, b.z - player.z);
+
+    if (b.kind === 'thrown') {
+      // 落地或撞到玩家 → 爆炸
+      const groundHit = b.y <= 0.18;
+      const bodyHit = pd < b.r + P_R + 0.3 && Math.abs(b.y - player.y) < 1.3;
+      if (groundHit || bodyHit || hit) {
+        explode(b, pd);
+        scene.remove(b.mesh);
+        bullets.splice(i, 1);
+        continue;
+      }
+    } else {
+      if (!hit && pd < b.r + P_R + 0.2 && Math.abs(b.y - player.y) < 1.2) {
+        hit = true;
+        damagePlayer(b.dmg);
+      }
+      if (hit) {
+        burst(b.x, b.y, b.z, b.color || 0xff3d7f, b.kind === 'breath' ? 18 : 5, b.kind === 'breath' ? 5 : 3, 0.2);
+        scene.remove(b.mesh);
+        bullets.splice(i, 1);
+      }
+    }
+  }
+}
+/** 投掷物爆炸：范围内伤害 */
+function explode(b, pd) {
+  const col = b.color || 0xffb03d;
+  burst(b.x, Math.max(0.15, b.y), b.z, col, 26, 7, 0.34);
+  burst(b.x, Math.max(0.15, b.y), b.z, 0xffffff, 8, 3, 0.22);
+  // 地面冲击环
+  const ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.2, b.radius || 1.8, 24),
+    new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.85, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false })
+  );
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.set(b.x, 0.06, b.z);
+  scene.add(ring);
+  shocks.push({ mesh: ring, life: 0.35 });
+  SFX.boom();
+  if (pd < (b.radius || 1.8) + P_R) damagePlayer(b.dmg);
+}
+function spawnPickup(x, z, type) {
+  const color = type === 'health' ? 0x7dff6b : type === 'ammo' ? 0xffc857 : 0x35e6ff;
+  const g = new THREE.Group();
+  const core = new THREE.Mesh(new THREE.OctahedronGeometry(0.32, 0), neonMat(0xffffff, color, 1.8));
+  g.add(core);
+  const halo = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.03, 6, 24),
+    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+  halo.rotation.x = Math.PI / 2;
+  g.add(halo);
+  addGlow(g, color, 1.6, 0.9);
+  g.position.set(x, 0.8, z);
+  scene.add(g);
+  pickups.push({ x, z, type, r: 0.8, life: 18, phase: rand(0, TAU), mesh: g, core, halo });
+}
+function updatePickups(dt) {
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const p = pickups[i];
+    p.life -= dt; p.phase += dt * 2;
+    p.mesh.position.y = 0.8 + Math.sin(p.phase) * 0.18;
+    p.mesh.rotation.y += dt * 2.2;
+    p.halo.rotation.z += dt * 1.6;
+    const d = Math.hypot(p.x - player.x, p.z - player.z);
+    if (d < p.r + P_R) {
+      if (p.type === 'health') { player.hp = Math.min(player.maxHp, player.hp + 30); }
+      if (p.type === 'ammo') { player.mag = player.magSize; player.reloadT = 0; }
+      if (p.type === 'rapid') { player.rapid = 9; }
+      collected++;
+      SFX.pickup();
+      burst(p.x, 0.8, p.z, p.core.material.emissive.getHex(), 10, 3.5, 0.2);
+      scene.remove(p.mesh);
+      pickups.splice(i, 1);
+      continue;
+    }
+    if (p.life <= 0) { scene.remove(p.mesh); pickups.splice(i, 1); }
+  }
+}
+
+/* ============================================================
+   11. 伤害 / 流程
+   ============================================================ */
+function damagePlayer(dmg) {
+  if (player.inv > 0 || state !== 'playing') return;
+  player.hp -= dmg;
+  player.inv = 0.55;
+  dmgFlash = 1;
+  shake = Math.max(shake, 2.2);
+  SFX.hurt();
+  if (player.hp <= 0) {
+    player.hp = 0;
+    state = 'dead';
+    SFX.over();
+    document.exitPointerLock?.();
+    showOverlay('游戏结束', `得分 <b>${player.score}</b> · 第 <b>${wave}</b> 波 · 击杀 <b>${kills}</b> · 最高连击 <b>${bestCombo}</b>`, '再来一局');
+  }
+}
+function startWave() {
+  wave++;
+  // 疾行者（黄色高速突进）已取消：压力改由更多冲锋兵 + 巨兽承担
+  const kaijuCount = wave >= 3 ? clamp(Math.floor(wave / 4), 1, 3) : 0;
+  banner = {
+    title: `第 ${wave} 波`,
+    sub: wave % 5 === 0 ? '警告：首领单位来袭' : (kaijuCount > 0 ? '警告：巨兽出没' : ''),
+    t: 2.2
+  };
+  SFX.wave();
+  if (wave % 5 === 0) {
+    const p = spawnPoint();
+    spawnEnemy('boss', clamp(p.x, -ARENA + 5, ARENA - 5), clamp(p.z, -ARENA + 5, ARENA - 5));
+    for (let i = 0; i < 3; i++) { const q = spawnPoint(); spawnEnemy('grunt', q.x, q.z); }
+    if (wave >= 5) { const q = spawnPoint(); spawnEnemy('kaiju', q.x, q.z); }
+    SFX.boss();
+  } else {
+    const grunts = Math.round(5 + wave * 1.5);
+    for (let i = 0; i < grunts; i++) spawnEnemy('grunt');
+    if (wave >= 3) for (let i = 0; i < Math.round(wave * 0.5); i++) spawnEnemy('shooter');
+    if (wave >= 4) for (let i = 0; i < Math.floor(wave / 4); i++) spawnEnemy('tank');
+    for (let i = 0; i < kaijuCount; i++) spawnEnemy('kaiju');
+  }
+}
+/* ---------- 指针锁定（非用户手势下可能抛错，统一兜底） ---------- */
+function lockPointer() {
+  try {
+    // 新版 Chrome 的 requestPointerLock 返回 Promise，被拒绝时会变成未处理的 rejection
+    const p = canvas.requestPointerLock?.();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* 忽略 */ }
+}
+function showOverlay(title, bodyHtml, btnText) {
+  el.ovTitle.textContent = title;
+  el.ovBody.innerHTML = bodyHtml;
+  el.ovBtn.textContent = btnText;
+  el.overlay.classList.remove('hide');
+}
+function hideOverlay() { el.overlay.classList.add('hide'); }
+function startGame() {
+  audioInit();
+  for (const e of enemies) { scene.remove(e.mesh); if (e.bar) scene.remove(e.bar.group); }
+  for (const b of bullets) scene.remove(b.mesh);
+  for (const p of pickups) scene.remove(p.mesh);
+  for (const t of tracers) { scene.remove(t.mesh); t.mesh.visible = false; tracerPool.push(t.mesh); }
+  for (const s of shocks) { scene.remove(s.mesh); s.mesh.geometry.dispose(); s.mesh.material.dispose(); }
+  enemies = []; bullets = []; pickups = []; tracers = []; shocks = []; hitTargets.length = 0; pState.length = 0;
+  projLog.length = 0;
+  gameTime = 0;
+  Object.assign(player, {
+    x: 0, z: ARENA * 0.55, y: EYE_H, vy: 0, vx: 0, vz: 0,
+    hp: 100, maxHp: 100, yaw: Math.PI, pitch: 0, grounded: true,
+    mag: MAG, magSize: MAG, reloadT: 0, fireCd: 0,
+    weapon: 0, spreadHeat: 0,
+    rapid: 0, recoil: 0, recoilPitch: 0, bob: 0,
+    swayX: 0, swayY: 0, score: 0, combo: 0, comboT: 0, dashCd: 0, inv: 0
+  });
+  wave = 0; kills = 0; bestCombo = 0; collected = 0; shake = 0; banner = null; waveTimer = 1.0;
+  state = 'playing';
+  hideOverlay();
+  updateLookMode();
+  lockPointer();
+}
+function pauseGame() {
+  if (state !== 'playing') return;
+  state = 'paused';
+  showOverlay('已暂停', '点击下方按钮或画面继续战斗。', '继续');
+}
+el.ovBtn.addEventListener('click', () => {
+  audioInit();
+  if (state === 'paused') { state = 'playing'; hideOverlay(); lockPointer(); }
+  else startGame();
+});
+
+/* ============================================================
+   12. 输入
+   ============================================================ */
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) e.preventDefault();
+  if (keys[k]) return;
+  keys[k] = true;
+  if (k === 'r') doReload();
+  if (k === '1') setWeapon(0);
+  if (k === '2') setWeapon(1);
+  if (k === 'q') setWeapon(player.weapon + 1);
+  if (k === 'm') muted = !muted;
+  if (k === 'escape') { if (state === 'playing') pauseGame(); }
+  if (k === 'enter') { if (state === 'menu' || state === 'dead') startGame(); }
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; mouse.down = false; });
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button === 0) {
+    if (state === 'menu' || state === 'dead') { startGame(); return; }
+    mouse.down = true;
+    if (!mouse.locked) lockPointer();
+  }
+});
+addEventListener('mouseup', e => { if (e.button === 0) mouse.down = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+// 鼠标滚轮切换武器
+addEventListener('wheel', e => {
+  if (state !== 'playing') return;
+  setWeapon(player.weapon + (e.deltaY > 0 ? 1 : -1));
+}, { passive: true });
+
+function updateLookMode() {
+  const locked = mouse.locked;
+  el.lookMode.textContent = locked
+    ? '鼠标已锁定 · 移动鼠标转头'
+    : '自由鼠标模式 · 移动鼠标转头（推到窗口边缘可持续转身；点击画面可锁定）';
+  el.lookMode.className = locked ? 'ok' : 'warn';
+  canvas.style.cursor = locked ? 'none' : 'crosshair';
+}
+document.addEventListener('pointerlockchange', () => {
+  mouse.locked = document.pointerLockElement === canvas;
+  lastX = lastY = null;          // 切换模式时重置，避免第一帧产生巨大位移
+  edgeDX = edgeDY = 0;
+  if (!mouse.locked) {
+    mouse.down = false;
+    if (state === 'playing') pauseGame();
+  }
+  updateLookMode();
+});
+// 指针锁定被拒（Esc 冷却、浏览器策略等）时静默降级到自由模式
+document.addEventListener('pointerlockerror', () => {
+  mouse.locked = false;
+  updateLookMode();
+});
+// 挂在 window 上：既能收到元素冒泡上来的事件，也能收到直接派发到 window 的事件
+addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+  mouse.inside = mouse.x >= 0 && mouse.y >= 0 && mouse.x <= r.width && mouse.y <= r.height;
+
+  if (mouse.locked) {
+    applyLook(e.movementX || 0, e.movementY || 0);
+    edgeDX = edgeDY = 0;
+    return;
+  }
+  // 自由模式：用光标的相对位移转头（鼠标停 → 视角停）
+  if (lastX === null) { lastX = e.clientX; lastY = e.clientY; return; }
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  if (dx || dy) {
+    applyLook(dx, dy);
+    edgeDX = dx; edgeDY = dy;    // 记住方向：贴到窗口边缘时持续朝该方向转身
+  }
+});
+
+function doReload() {
+  const w = WEAPONS[player.weapon];
+  if (state !== 'playing' || player.reloadT > 0 || player.mag >= player.magSize) return;
+  player.reloadT = w.reload;
+  SFX.reload();
+}
+
+/* ============================================================
+   13. 视图模型 / HUD
+   ============================================================ */
+function updateGun(dt) {
+  player.recoil = Math.max(0, player.recoil - dt * 0.55);
+  recoilSpring = Math.max(0, recoilSpring - dt * 7);
+  player.swayX *= Math.pow(0.0015, dt);
+  player.swayY *= Math.pow(0.0015, dt);
+
+  const spd = Math.hypot(player.vx, player.vz);
+  const bobAmp = clamp(spd / SPRINT, 0, 1) * 0.022;
+  const bobX = Math.sin(player.bob * 2) * bobAmp;
+  const bobY = Math.abs(Math.cos(player.bob)) * bobAmp;
+
+  const target = new THREE.Vector3(0.26 + player.swayX, -0.23 + player.swayY + bobY, -0.5 + player.recoil);
+  if (gunPose) {
+    // 调试/定妆照用：固定枪的位姿
+    gun.position.set(gunPose.x, gunPose.y, gunPose.z);
+    gun.rotation.set(gunPose.rx, gunPose.ry, gunPose.rz);
+  } else {
+    gun.position.lerp(target, Math.min(1, 16 * dt));
+    gun.rotation.set(-player.recoil * 2.6, player.swayX * 1.4, bobX * 0.8 + player.swayX * 0.6);
+  }
+
+  muzzleFlash.material.opacity = Math.max(0, muzzleFlash.material.opacity - dt * 26);
+  const accent = player.rapid > 0 ? 0x7dff6b : 0x35e6ff;
+  gun.userData.cells.forEach(c => {
+    if (c.material.emissive) c.material.emissive.setHex(accent);
+    else c.material.color.setHex(accent);          // MeshBasicMaterial 没有 emissive
+  });
+  gun.userData.glow.material.color.setHex(accent);
+  // 加特林：枪管惯性旋转 —— 开火时加速，停火后缓慢减速
+  // 只有转子（枪管束 + 轮毂 + 蛛爪 + 消焰器）转；散热笼、两脚支架、机匣、弹鼓全部静止，
+  // 这样才和真加特林一致：前导环和支架是固定结构，转的只有管子自己。
+  if (gun.userData.rotor) {
+    player.spin = Math.max(0, (player.spin || 0) - dt * 1.8);
+    gun.userData.rotor.rotation.z += (5 + player.spin * 38) * dt;
+  }
+}
+function updateHUD(dt) {
+  const pct = clamp(player.hp / player.maxHp, 0, 1);
+  el.hpFill.style.width = (pct * 100) + '%';
+  el.hpText.textContent = Math.ceil(player.hp);
+  el.hpBar.classList.toggle('low', pct <= 0.35);
+  el.ammo.textContent = player.reloadT > 0 ? '换弹中…' : `${player.mag} / ${player.magSize}`;
+  el.weapon.textContent = WEAPONS[player.weapon].name;
+  el.dash.className = 'stat ' + (player.dashCd <= 0 ? 'ready' : 'cool');
+  el.dashText.textContent = player.dashCd <= 0 ? '就绪' : player.dashCd.toFixed(1) + 's';
+  el.wave.textContent = wave || 1;
+  el.score.textContent = player.score;
+  const boss = enemies.find(e => e.type === 'boss');
+  el.bossWrap.classList.toggle('on', !!boss);
+  // 波次横幅：banner 对象以前只存在、从来没画到屏幕上
+  if (banner) {
+    el.banner.querySelector('b').textContent = banner.title;
+    el.banner.querySelector('span').textContent = banner.sub || '';
+    el.banner.style.opacity = clamp(banner.t / 1.1, 0, 1).toFixed(2);
+  } else {
+    el.banner.style.opacity = '0';
+  }
+  if (boss) el.bossFill.style.width = clamp(boss.hp / boss.maxHp, 0, 1) * 100 + '%';
+
+  // 准星扩散
+  const spread = 6 + Math.hypot(player.vx, player.vz) * 0.55 + (player.rapid > 0 ? 3 : 0);
+  el.cross.style.transform = `scale(${(spread / 13).toFixed(3)})`;
+
+  // 受击 / 低血
+  dmgFlash = Math.max(0, dmgFlash - dt * 2.2);
+  el.dmg.style.opacity = (dmgFlash * 0.85).toFixed(3);
+  el.lowhp.style.opacity = (pct < 0.35 ? (0.35 - pct) * 1.5 : 0).toFixed(3);
+
+  // 命中标记
+  hitFlash = Math.max(0, hitFlash - dt * 4.2);
+  el.hitmark.style.opacity = clamp(hitFlash * 6, 0, 1).toFixed(2);
+  if (hitFlash <= 0) el.hitmark.classList.remove('kill');
+}
+
+/* ============================================================
+   14. 主循环
+   ============================================================ */
+function loop() {
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (state === 'playing') {
+    gameTime += dt;
+    if (banner) { banner.t -= dt; if (banner.t <= 0) banner = null; }
+    if (enemies.length === 0) {
+      waveTimer -= dt;
+      if (waveTimer <= 0) { startWave(); waveTimer = 2.0; }
+    } else waveTimer = 2.0;
+
+    player.fireCd -= dt;
+    player.dashCd = Math.max(0, player.dashCd - dt);
+    if (player.reloadT > 0) {
+      player.reloadT -= dt;
+      if (player.reloadT <= 0) { player.mag = player.magSize; player.reloadT = 0; }
+    } else if (player.mag <= 0) {
+      player.reloadT = WEAPONS[player.weapon].reload; SFX.reload();
+    }
+
+    updateFreeLook(dt);     // 先转向，再让 movePlayer 把新朝向写进相机
+    movePlayer(dt);
+    if (mouse.down) tryFire();
+    updateEnemies(dt);
+    updateBullets(dt);
+    updateFlashes(dt);
+    updatePickups(dt);
+    updateParticles(dt);
+    updateTracers(dt);
+    updateShocks(dt);
+    updateGun(dt);
+    updateHUD(dt);
+    shake *= 0.86;
+    // 屏幕震动（轻微，作用在相机上）
+    if (shake > 0.05) {
+      camera.position.x += rand(-shake, shake) * 0.02;
+      camera.position.y += rand(-shake, shake) * 0.02;
+      camera.rotation.z = rand(-shake, shake) * 0.006;
+    } else camera.rotation.z = 0;
+  } else {
+    updateParticles(dt);
+    updateTracers(dt);
+    updateShocks(dt);
+    updateGun(dt);
+    shake *= 0.9;
+  }
+  renderer.render(scene, camera);
+}
+
+/* ============================================================
+   15. 启动
+   ============================================================ */
+
+/* ================= 诊断 ================= */
+makeSurfaceMaps = () => ({ map: null, normalMap: null, roughnessMap: null });
+makeGunMetalMaps = () => ({ map: null, normalMap: null, roughnessMap: null });
+makeTubeMaps = () => ({ map: null, normalMap: null, roughnessMap: null });
+makeMarkingMaps = () => ({ map: null, normalMap: null });
+camera = new THREE.Group();
+renderer = { capabilities: { getMaxAnisotropy: () => 8 }, render: () => {}, info: { render: { calls: 0, triangles: 0 } } };
+initMaterials();
+
+function analyse(kind) {
+  const gunG = buildWeapon(kind);
+  const rotor = gunG.userData.rotor;
+  if (!rotor) { console.log(kind + ': 无转子'); return; }
+  const parts = [];
+  gunG.traverse(o => { if (o.isMesh) parts.push(o); });
+  const snap = () => {
+    gunG.updateMatrixWorld(true);
+    const mp = new Map();
+    for (const o of parts) mp.set(o, o.getWorldPosition(new THREE.Vector3()).clone());
+    return mp;
+  };
+  rotor.rotation.z = 0;
+  const A = snap();
+  rotor.rotation.z = Math.PI / 2;
+  gunG.updateMatrixWorld(true);
+  const B = snap();
+  const describe = o => {
+    const p = (o.geometry && o.geometry.parameters) || {};
+    const dims = ['radius', 'height', 'innerRadius', 'outerRadius', 'width', 'length']
+      .filter(k => p[k] != null).map(k => k + '=' + p[k]).join(' ');
+    const par = o.parent === gunG ? '静止枪身' : o.parent === rotor ? '转子 rotor' : (o.parent.type || 'group');
+    return o.geometry.type + ' ' + dims + ' | 挂在: ' + par + ' | 局部z=' + o.position.z.toFixed(3);
+  };
+  let nMove = 0;
+  console.log('\n===== ' + kind + ' (' + parts.length + ' 个网格) =====');
+  console.log('--- 转子转 90 度后【会移动】的零件 ---');
+  for (const o of parts) {
+    const d = A.get(o).distanceTo(B.get(o));
+    if (d > 1e-6) { nMove++; console.log('  ' + describe(o) + ' | 位移=' + d.toFixed(4)); }
+  }
+  console.log('--- 转子转 90 度后【保持静止】的零件 ---');
+  for (const o of parts) {
+    const d = A.get(o).distanceTo(B.get(o));
+    if (d <= 1e-6) console.log('  ' + describe(o));
+  }
+  console.log('移动件数: ' + nMove + ' / ' + parts.length);
+}
+analyse('gatling');
+exportMeshes('gatling');
+
+/* ---------- 巨兽模型自检：装配连通性 + 尺寸 + 网格导出 ---------- */
+function kaijuCheck() {
+  const hm = makeKaiju('kaiju');
+  const root = hm.root;
+  root.updateMatrixWorld(true);
+  const meshes = [];
+  root.traverse(o => { if (o.isMesh) meshes.push(o); });
+  const boxes = meshes.map(o => ({ o, box: new THREE.Box3().setFromObject(o) }));
+  const parent = boxes.map((_, i) => i);
+  const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  for (let i = 0; i < boxes.length; i++) {
+    for (let j = i + 1; j < boxes.length; j++) {
+      const a = boxes[i].box, b = boxes[j].box;
+      const ox = Math.min(a.max.x, b.max.x) - Math.max(a.min.x, b.min.x);
+      const oy = Math.min(a.max.y, b.max.y) - Math.max(a.min.y, b.min.y);
+      const oz = Math.min(a.max.z, b.max.z) - Math.max(a.min.z, b.min.z);
+      if (ox > 0 && oy > 0 && oz > 0) parent[find(i)] = find(j);
+    }
+  }
+  const groups = {};
+  boxes.forEach((b, i) => { const r = find(i); groups[r] = (groups[r] || 0) + 1; });
+  const comps = Object.entries(groups).sort((a, b) => b[1] - a[1]);
+  console.log('\n===== 巨兽装配自检 =====');
+  console.log('网格数: ' + meshes.length + '，连通分量: ' + comps.length + '（最大分量 ' + comps[0][1] + ' 个网格）');
+  for (const [r, n] of comps) {
+    const p = boxes[+r].o.getWorldPosition(new THREE.Vector3());
+    console.log('  分量 ' + n + ' 网格，代表: ' + boxes[+r].o.geometry.type + ' @ (' +
+      p.x.toFixed(2) + ', ' + p.y.toFixed(2) + ', ' + p.z.toFixed(2) + ')');
+    if (n < 10) {
+      boxes.forEach((b, i) => {
+        if (find(i) === +r) {
+          const c = b.box.getCenter(new THREE.Vector3());
+          const s = b.box.getSize(new THREE.Vector3());
+          console.log('     ' + b.o.geometry.type + ' 中心(' + c.x.toFixed(3) + ',' + c.y.toFixed(3) + ',' + c.z.toFixed(3) + ') 尺寸(' + s.x.toFixed(3) + ',' + s.y.toFixed(3) + ',' + s.z.toFixed(3) + ')');
+        }
+      });
+    }
+  }
+  const full = new THREE.Box3().setFromObject(root);
+  console.log('尺寸（米）: 高 ' + (full.max.y - full.min.y).toFixed(2) +
+              ' 长 ' + (full.max.z - full.min.z).toFixed(2) +
+              ' 宽 ' + (full.max.x - full.min.x).toFixed(2) +
+              ' | 脚底 y=' + full.min.y.toFixed(3) + ' 头顶 y=' + full.max.y.toFixed(2));
+  return hm;
+}
+function exportKaiju(hm) {
+  const root = hm.root;
+  const frames = [];
+  for (const pose of [0, 1]) {
+    hm.jaw.rotation.x = pose * 0.8;
+    hm.head.rotation.x = pose * 0.3;
+    root.updateMatrixWorld(true);
+    const tris = [];
+    root.traverse(o => {
+      if (!o.isMesh) return;
+      const geo = o.geometry, pos = geo.attributes.position;
+      const idx = geo.indices ? geo.indices.array : Array.from({ length: pos.count }, (_, i) => i);
+      const V = [];
+      for (let i = 0; i < pos.count; i++) {
+        const v = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(o.matrixWorld);
+        V.push([v.x, v.y, v.z]);
+      }
+      const mat = o.material;
+      let col;
+      if (mat === hm.mats.belly) col = [152, 148, 124];
+      else if (mat === hm.mats.plate) col = [126, 130, 122];
+      else if (mat === hm.mats.scale) col = [100, 112, 84];
+      else if (mat === hm.mats.eye) col = [255, 176, 61];
+      else col = [70, 90, 120];                       // 吐息能量球等
+      const isRim = mat.side === THREE.BackSide;
+      for (let k = 0; k + 2 < idx.length; k += 3) {
+        const a = V[idx[k]], b = V[idx[k + 1]], c = V[idx[k + 2]];
+        tris.push({ t: [a, b, c], n: [(b[1]-a[1])*(c[2]-a[2])-(b[2]-a[2])*(c[1]-a[1]),
+                                   (b[2]-a[2])*(c[0]-a[0])-(b[0]-a[0])*(c[2]-a[2]),
+                                   (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])],
+                    c: col, rim: isRim });
+      }
+    });
+    frames.push(tris);
+  }
+  fs.writeFileSync(path.join(dir, 'kaiju-mesh.json'), JSON.stringify(frames));
+  console.log('导出巨兽网格: ' + frames[0].length + ' 个三角形（闭嘴 / 张口两帧）');
+}
+const kaiju = kaijuCheck();
+exportKaiju(kaiju);
+
+/* ---------- 冒烟测试：把 AI 循环跑几波，抓运行时错误 ---------- */
+function smokeTest() {
+  scene = new THREE.Group();
+  camera = new THREE.Group();
+  camera.position.set(0, 1.65, 6);
+  renderer = { capabilities: { getMaxAnisotropy: () => 8 }, render: () => {}, info: { render: { calls: 0, triangles: 0 } } };
+  initMaterials();
+  initParticles();
+  player.hp = 1e6;
+  const seen = {};
+  for (let w = 1; w <= 3; w++) {
+    startWave();
+    for (let step = 0; step < 220; step++) {
+      const dt = 0.05;
+      updateEnemies(dt);
+      updateBullets(dt);
+      updateFlashes(dt);
+      updateParticles(dt);
+      updatePickups(dt);
+    }
+    for (const e of enemies) seen[e.type] = (seen[e.type] || 0) + 1;
+  }
+  console.log('\n===== 冒烟测试（3 波 × 11 秒）=====');
+  console.log('无运行时错误。存活敌人 ' + enemies.length + ' 个：' + JSON.stringify(seen));
+  console.log('原子吐息发射 ' + projLog.filter(p => p.kind === 'breath').length + ' 次；投射物在场 ' + bullets.length + ' 个');
+  console.log('命中体数量 ' + hitTargets.length + '（躯干 + 头）');
+  const e = enemies.find(x => x.type === 'kaiju');
+  if (e) console.log('巨兽样例：hp ' + e.hp.toFixed(0) + ' r ' + e.r.toFixed(2) + ' speed ' + e.speed.toFixed(2) + ' 血条宽 ' + (e.bar ? e.bar.w : '-'));
+}
+smokeTest();
+function exportMeshes(kind) {
+  const gunG = buildWeapon(kind);
+  const rotor = gunG.userData.rotor;
+  const frames = [];
+  for (const angle of [0, Math.PI / 2]) {
+    rotor.rotation.z = angle;
+    gunG.updateMatrixWorld(true);
+    const tris = [];
+    gunG.traverse(o => {
+      if (!o.isMesh) return;
+      const geo = o.geometry;
+      if (!geo) return;
+      const isRotor = o === rotor || (o.parent !== gunG && (function inRotor(n) { while (n && n !== gunG) { if (n === rotor) return true; n = n.parent; } return false; })(o.parent));
+      const pos = geo.attributes.position;
+      const idx = geo.indices ? geo.indices.array : Array.from({ length: pos.count }, (_, i) => i);
+      const V = [];
+      for (let i = 0; i < pos.count; i++) {
+        const v = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(o.matrixWorld);
+        V.push([v.x, v.y, v.z]);
+      }
+      for (let k = 0; k + 2 < idx.length; k += 3) {
+        const a = V[idx[k]], b = V[idx[k + 1]], c = V[idx[k + 2]];
+        const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+        const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const len = Math.hypot(nx, ny, nz);
+        if (len < 1e-9) continue;
+        tris.push({ t: [a, b, c], n: [nx / len, ny / len, nz / len], r: isRotor ? 1 : 0 });
+      }
+    });
+    frames.push(tris);
+  }
+  fs.writeFileSync(path.join(dir, 'gatling-mesh.json'), JSON.stringify(frames));
+  console.log('导出网格: ' + frames[0].length + ' 个三角形（转子 0° / 90° 两帧）');
+}
+exportMeshes('gatling');
