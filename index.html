@@ -114,7 +114,7 @@
     <div id="hitmark"><i></i><i></i><i></i><i></i></div>
     <div id="dmg"></div>
     <div id="lowhp"></div>
-    <div id="bossWrap"><span>⚠ 首领单位 ⚠</span><div id="bossBar"><i id="bossFill"></i></div></div>
+    <div id="bossWrap"><span>⚠ 尸王出没 ⚠</span><div id="bossBar"><i id="bossFill"></i></div></div>
     <div id="waveBanner"><b></b><span></span></div>
     <div id="loading">正在初始化 WEBGL 场景…</div>
     <div id="overlay" class="hide">
@@ -1048,6 +1048,151 @@ function makeSurfaceMaps(cfg) {
   return { map, normalMap, roughnessMap };
 }
 
+/* ---------- 僵尸专用贴图：腐尸皮肤 / 破烂衣物 ---------- */
+/** 不规则脏污团：几层径向渐变叠出来的边缘，避免"完美圆形"的塑料感 */
+function rotBlob(A, x, y, r, rgb, a) {
+  const g = A.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(${rgb},${a})`);
+  g.addColorStop(0.62, `rgba(${rgb},${a * 0.42})`);
+  g.addColorStop(1, `rgba(${rgb},0)`);
+  A.fillStyle = g;
+  A.beginPath(); A.arc(x, y, r, 0, 7); A.fill();
+}
+/** 腐尸皮肤：病态灰绿底色 + 尸斑 + 坏死死皮 + 干血 + 静脉 + 逐像素颗粒 */
+function makeRottenMaps(size = 512, seed = 5) {
+  const R = seeded((seed * 7919 + 5) >>> 0);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const rgh = document.createElement('canvas'); rgh.width = rgh.height = size;
+  const A = alb.getContext('2d'), G = rgh.getContext('2d');
+
+  A.fillStyle = '#87906f'; A.fillRect(0, 0, size, size);   // 灰绿底
+  G.fillStyle = '#d8d8d8'; G.fillRect(0, 0, size, size);   // 默认粗糙度很高
+
+  // 1) 大面积尸斑：腐败的黄褐色
+  for (let i = 0; i < 90; i++) {
+    rotBlob(A, R() * size, R() * size, 10 + R() * 52, '126,116,66', 0.40);
+  }
+  // 2) 坏死死皮：发黑发青
+  for (let i = 0; i < 46; i++) {
+    const x = R() * size, y = R() * size, r = 5 + R() * 26;
+    rotBlob(A, x, y, r, '28,32,24', 0.72);
+    rotBlob(A, x, y, r * 0.7, '46,58,44', 0.34);
+    // 湿润的伤口：粗糙度骤降 → 会反光
+    const rg = G.createRadialGradient(x, y, 0, x, y, r * 0.8);
+    rg.addColorStop(0, 'rgba(96,96,96,0.8)');
+    rg.addColorStop(1, 'rgba(0,0,0,0)');
+    G.fillStyle = rg; G.beginPath(); G.arc(x, y, r * 0.8, 0, 7); G.fill();
+  }
+  // 3) 干涸的血：从斑块往下拖的暗红条带
+  for (let i = 0; i < 34; i++) {
+    const x = R() * size, y = R() * size, w = 3 + R() * 12, h = 20 + R() * 90;
+    const g = A.createLinearGradient(x, y, x, y + h);
+    g.addColorStop(0, 'rgba(104,26,22,0.62)');
+    g.addColorStop(1, 'rgba(72,18,16,0)');
+    A.fillStyle = g; A.fillRect(x, y, w, h);
+  }
+  // 4) 静脉：青黑色的细线
+  A.lineCap = 'round';
+  for (let i = 0; i < 60; i++) {
+    A.strokeStyle = 'rgba(44,58,72,0.50)';
+    A.lineWidth = 0.8 + R() * 1.8;
+    A.beginPath();
+    let x = R() * size, y = R() * size;
+    A.moveTo(x, y);
+    for (let k = 0; k < 5; k++) { x += (R() - 0.5) * 34; y += (R() - 0.2) * 34; A.lineTo(x, y); }
+    A.stroke();
+  }
+  // 5) 逐像素的颗粒与亮暗不均
+  const img = A.getImageData(0, 0, size, size);
+  const rimg = G.getImageData(0, 0, size, size);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const i = (y * size + x) * 4;
+    const n1 = hashNoise(x, y, seed * 31 + 7);
+    const n2 = hashNoise(x >> 1, y >> 1, seed * 17 + 3);
+    const k = 1 + (n1 - 0.5) * 0.26 + (n2 - 0.5) * 0.14;
+    img.data[i] = clamp(img.data[i] * k, 0, 255);
+    img.data[i + 1] = clamp(img.data[i + 1] * k * 0.99, 0, 255);
+    img.data[i + 2] = clamp(img.data[i + 2] * k * 0.97, 0, 255);
+    rimg.data[i] = rimg.data[i + 1] = rimg.data[i + 2] = clamp(rimg.data[i] + (n1 - 0.5) * 40, 0, 255);
+  }
+  A.putImageData(img, 0, 0); G.putImageData(rimg, 0, 0);
+
+  // 高度：亮处（皮肤）凸起，暗处（坏死斑、干血）凹陷
+  const hgt = document.createElement('canvas'); hgt.width = hgt.height = size;
+  const H = hgt.getContext('2d');
+  H.putImageData(img, 0, 0);
+  const hd = H.getImageData(0, 0, size, size).data;
+  const hh = new Float32Array(size * size);
+  for (let i = 0; i < size * size; i++) {
+    hh[i] = 1 - (hd[i * 4] * 0.34 + hd[i * 4 + 1] * 0.5 + hd[i * 4 + 2] * 0.16) / 255;
+  }
+  return {
+    map: tex(alb, true, 2),
+    normalMap: tex(canvasToNormal(hgt, 2.0), false, 2),
+    roughnessMap: tex(rgh, false, 2)
+  };
+}
+/** 破烂衣物：脏布 + 破洞（alphaMap）+ 焦边；破洞让底下的腐肉露出来 */
+function makeTatteredMaps(size = 512, seed = 13, repeat = 3) {
+  const R = seeded((seed * 7919 + 29) >>> 0);
+  const alb = document.createElement('canvas'); alb.width = alb.height = size;
+  const alp = document.createElement('canvas'); alp.width = alp.height = size;
+  const A = alb.getContext('2d'), P = alp.getContext('2d');
+
+  A.fillStyle = '#4c4b42'; A.fillRect(0, 0, size, size);
+  P.fillStyle = '#ffffff'; P.fillRect(0, 0, size, size);
+
+  // 织物斜纹
+  A.globalAlpha = 0.18;
+  for (let i = 0; i < size; i += 3) {
+    A.strokeStyle = i % 6 ? '#6b6a5d' : '#33332c';
+    A.lineWidth = 1.6;
+    A.beginPath(); A.moveTo(i, 0); A.lineTo(i + size * 0.5, size); A.stroke();
+  }
+  A.globalAlpha = 1;
+
+  // 破洞与撕裂：先在 alpha 画布上挖掉，再在 albedo 上画一圈焦黄/发黑的边
+  const holes = [];
+  for (let i = 0; i < 15; i++) holes.push([R() * size, R() * size, 6 + R() * 20, R() * 6.28]);
+  for (let i = 0; i < 10; i++) holes.push([R() * size, R() * size, 4 + R() * 9, R() * 6.28, 1]);
+  for (const h of holes) {
+    const [x, y, r, rot, tear] = h;
+    // alpha：挖洞
+    P.fillStyle = '#000';
+    P.save(); P.translate(x, y); P.rotate(rot);
+    P.beginPath();
+    if (tear) P.ellipse(0, 0, r, r * (2.4 + R() * 2.4), 0, 0, 7);
+    else {
+      for (let k = 0; k < 7; k++) {
+        const a = k / 7 * 6.28, rr = r * (0.55 + R() * 0.6);
+        P.moveTo(Math.cos(a) * rr + r * 0.4, Math.sin(a) * rr);
+        P.arc(Math.cos(a) * rr + r * 0.4, Math.sin(a) * rr, r * 0.5, 0, 7);
+      }
+    }
+    P.fill(); P.restore();
+    // albedo：洞口的焦边与污渍
+    rotBlob(A, x, y, r * 1.5, '92,72,44', 0.5);
+    rotBlob(A, x, y, r * 0.9, '38,30,22', 0.55);
+  }
+  // 整体的脏污
+  for (let i = 0; i < 40; i++) rotBlob(A, R() * size, R() * size, 12 + R() * 46, '26,30,24', 0.28);
+  for (let i = 0; i < 12; i++) rotBlob(A, R() * size, R() * size, 8 + R() * 26, '86,22,18', 0.35);
+
+  // 逐像素颗粒
+  const img = A.getImageData(0, 0, size, size);
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const i = (y * size + x) * 4;
+    const n = hashNoise(x, y, seed * 13 + 5);
+    const k = 1 + (n - 0.5) * 0.24;
+    img.data[i] = clamp(img.data[i] * k, 0, 255);
+    img.data[i + 1] = clamp(img.data[i + 1] * k, 0, 255);
+    img.data[i + 2] = clamp(img.data[i + 2] * k, 0, 255);
+  }
+  A.putImageData(img, 0, 0);
+
+  return { map: tex(alb, true, repeat), alphaMap: tex(alp, false, repeat) };
+}
+
 /* ============================================================
    场景贴图 —— 大幅 canvas 绘制（污渍 / 裂缝 / 锈迹 / 磨损）
    ============================================================ */
@@ -1959,6 +2104,21 @@ function initMaterials() {
   MAT.polymer  = new THREE.MeshStandardMaterial({ ...polymer, color: 0xffffff, metalness: 0.06, roughness: 1, envMapIntensity: 0.55 });
   MAT.hair   = new THREE.MeshStandardMaterial({ ...hair, color: 0xffffff, metalness: 0.05, roughness: 1, envMapIntensity: 0.5 });
   MAT.leather = new THREE.MeshStandardMaterial({ ...leather, color: 0xffffff, metalness: 0.05, roughness: 1, envMapIntensity: 0.5 });
+  // —— 僵尸：腐尸皮肤 / 破烂衣物 / 骨骼 / 血痂 ——
+  const rotten = makeRottenMaps(512, 5);
+  const tattered = makeTatteredMaps(512, 13, 3);
+  MAT.zSkin = new THREE.MeshStandardMaterial({
+    ...rotten, color: 0xffffff, metalness: 0.02, roughness: 1, envMapIntensity: 0.42
+  });
+  MAT.rags = new THREE.MeshStandardMaterial({
+    map: tattered.map, alphaMap: tattered.alphaMap,
+    normalMap: jacket.normalMap, roughnessMap: jacket.roughnessMap,
+    color: 0xffffff, metalness: 0.0, roughness: 1, envMapIntensity: 0.28,
+    alphaTest: 0.5, side: THREE.DoubleSide
+  });
+  MAT.bone = new THREE.MeshStandardMaterial({ color: 0xd6cdb2, roughness: 0.72, metalness: 0.0, envMapIntensity: 0.5 });
+  MAT.gore = new THREE.MeshStandardMaterial({ color: 0x4a1010, roughness: 0.38, metalness: 0.0, envMapIntensity: 0.7 });
+
   // —— 巨兽（哥斯拉型）：鳞甲 / 腹板 / 背板 ——
   MAT.kaijuScale = new THREE.MeshStandardMaterial({ ...scales, color: 0xffffff, metalness: 0.08, roughness: 1, envMapIntensity: 0.62 });
   MAT.kaijuBelly = new THREE.MeshStandardMaterial({ ...belly, color: 0xffffff, metalness: 0.04, roughness: 1, envMapIntensity: 0.45 });
@@ -2125,21 +2285,21 @@ function makeGunEnvMap() {
    4. 敌人
    ============================================================ */
 const ENEMY_TYPES = {
-  grunt:  { hp: 45,  r: 0.55, speed: 4.2,  color: 0xff4d6d, score: 100,  melee: 10 },
-  shooter:{ hp: 38,  r: 0.5,  speed: 3.2,  color: 0xc04dff, score: 180,  melee: 10 },
-  tank:   { hp: 190, r: 1.0,  speed: 2.2,  color: 0x39d98a, score: 400,  melee: 22 },
-  kaiju:  { hp: 340, r: 0.72, speed: 3.4,  color: 0xff7a33, score: 1200, melee: 32 },
-  boss:   { hp: 900, r: 1.7,  speed: 2.6,  color: 0xff2f6d, score: 3000, melee: 26 }
+  grunt:  { hp: 45,  r: 0.55, speed: 4.2,  color: 0x8ef05a, score: 100,  melee: 10, name: '游荡者' },
+  shooter:{ hp: 38,  r: 0.5,  speed: 3.2,  color: 0xd6f24a, score: 180,  melee: 10, name: '吐酸者' },
+  tank:   { hp: 190, r: 1.0,  speed: 2.2,  color: 0x46e0b4, score: 400,  melee: 22, name: '碎骨者' },
+  kaiju:  { hp: 340, r: 0.72, speed: 3.4,  color: 0xe0b83c, score: 1200, melee: 32, name: '腐化巨兽' },
+  boss:   { hp: 900, r: 1.7,  speed: 2.6,  color: 0xff3d6e, score: 3000, melee: 26, name: '尸王' }
 };
-/* ---------- 人形敌人：全部由基本体拼装，带行走/挥击动画 ---------- */
+/* ---------- 僵尸：全部由基本体拼装，带蹒跚行走 / 抓挠动画 ---------- */
 const BODY_SPEC = {
-  grunt:   { s: 1.00, w: 1.00, h: 1.00, walk: 6.5 },
-  shooter: { s: 1.00, w: 0.94, h: 1.00, walk: 6.0 },
-  tank:    { s: 1.42, w: 1.50, h: 1.06, walk: 4.2 },
+  grunt:   { s: 1.00, w: 1.00, h: 1.00, walk: 4.6 },
+  shooter: { s: 1.00, w: 0.94, h: 1.00, walk: 4.4 },
+  tank:    { s: 1.42, w: 1.50, h: 1.06, walk: 3.2 },
   kaiju:   { s: 1.60, w: 1.20, h: 1.15, walk: 2.4 },
-  boss:    { s: 2.05, w: 1.34, h: 1.14, walk: 3.6 }
+  boss:    { s: 2.05, w: 1.34, h: 1.14, walk: 3.0 }
 };
-function makeHumanoid(type) {
+function makeZombie(type) {
   const t = ENEMY_TYPES[type];
   const spec = BODY_SPEC[type];
   const root = new THREE.Group();
@@ -2148,148 +2308,199 @@ function makeHumanoid(type) {
 
   // 每个敌人独立一份材质实例（命中白闪要单独控制），贴图本身共享
   const M = {
-    skin: MAT.skin.clone(), jacket: MAT.jacket.clone(), pants: MAT.pants.clone(),
-    hair: MAT.hair.clone(), leather: MAT.leather.clone()
+    skin: MAT.zSkin.clone(),     // 腐肉
+    rags: MAT.rags.clone(),      // 破布（带 alphaMap 的破洞）
+    bone: MAT.bone.clone(),      // 露在外面的骨头
+    gore: MAT.gore.clone(),      // 血痂 / 伤口
+    hair: MAT.hair.clone()       // 残存的头发
   };
-  // 服装带一点敌人类型色，保持辨识度
+  // 破布带一点敌人类型色；真正的辨识特征是眼窝里那点荧光
   const tint = new THREE.Color(t.color);
-  M.jacket.color.copy(tint).lerp(new THREE.Color(0x8d92ab), 0.74);
-  M.pants.color.copy(tint).lerp(new THREE.Color(0x70768e), 0.82);
-  M.hair.color.setHSL(0.07, 0.32, 0.08 + rand(0, 0.07));
-  M.skin.color.setHSL(0.075, 0.40, 0.48 + rand(-0.14, 0.14));
+  M.rags.color.copy(tint).lerp(new THREE.Color(0x3c3b33), 0.84);
+  M.skin.color.setHSL(0.20, 0.15, 0.53);              // 病态的灰绿
+  M.hair.color.setHSL(0.07, 0.28, 0.06 + rand(0, 0.05));
 
-  // ---- 躯干（夹克）----
-  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.44 * spec.w, 0.56 * spec.h, 0.26 * spec.w), M.jacket);
-  torso.position.y = 1.12;
+  const W = spec.w, H = spec.h;
+
+  /* ---- 骨盆：一条已经烂穿的裤子 ---- */
+  const hips = new THREE.Mesh(new THREE.BoxGeometry(0.36 * W, 0.19, 0.24 * W), M.rags);
+  hips.position.y = 0.74; hips.castShadow = true;
+  body.add(hips);
+
+  /* ---- 躯干（命中体）：消瘦的躯干，外面直接是腐肉 ---- */
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.40 * W, 0.54 * H, 0.23 * W), M.skin);
+  torso.position.y = 1.11;
   torso.castShadow = true; torso.receiveShadow = true;
   body.add(torso);
 
-  // 拉链与口袋
-  const zip = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.50 * spec.h, 0.018), M.leather);
-  zip.position.set(0, 1.12, 0.133 * spec.w);
-  body.add(zip);
-  for (const s of [1, -1]) {
-    const pocket = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.065, 0.018), M.leather);
-    pocket.position.set(s * 0.105 * spec.w, 0.995, 0.132 * spec.w);
-    body.add(pocket);
+  // 破衬衫：套在躯干外面薄薄一层，破洞正好露出肋骨
+  const shirt = new THREE.Mesh(new THREE.BoxGeometry(0.415 * W, 0.46 * H, 0.245 * W), M.rags);
+  shirt.position.y = 1.16;
+  shirt.castShadow = true;
+  body.add(shirt);
+
+  // 下摆的破布条
+  for (let i = 0; i < 4; i++) {
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(0.075 * W, 0.16 + rand(0, 0.13), 0.02), M.rags);
+    strip.position.set((i - 1.5) * 0.085 * W, 0.885 - rand(0, 0.05), 0.118 * W);
+    strip.rotation.z = rand(-0.22, 0.22);
+    body.add(strip);
   }
-  // 胸口霓虹核心（保留赛博感）
-  const chest = new THREE.Mesh(new THREE.SphereGeometry(0.072, 10, 8),
+
+  // 肋骨：从敞开的胸腔里露出来
+  for (let i = 0; i < 4; i++) {
+    const rib = new THREE.Mesh(new THREE.BoxGeometry(0.30 * W, 0.022, 0.035), M.bone);
+    rib.position.set(0, 1.21 - i * 0.063, 0.118 * W);
+    rib.rotation.z = rand(-0.035, 0.035);
+    body.add(rib);
+  }
+  // 敞开的伤口
+  const wound = new THREE.Mesh(new THREE.BoxGeometry(0.12 * W, 0.16 * H, 0.03), M.gore);
+  wound.position.set(0.015 * W, 1.19, 0.112 * W);
+  wound.rotation.z = 0.26;
+  body.add(wound);
+  // 伤口里透出的感染核心
+  const chest = new THREE.Mesh(new THREE.SphereGeometry(0.045, 8, 6),
     new THREE.MeshBasicMaterial({ color: t.color, toneMapped: false }));
-  chest.position.set(0, 1.21, 0.135 * spec.w);
+  chest.position.set(0.015 * W, 1.19, 0.132 * W);
   body.add(chest);
-  addGlow(chest, t.color, 0.46, 0.75);
+  addGlow(chest, t.color, 0.34, 0.8);
 
-  // ---- 腰带 / 髋 ----
-  const belt = new THREE.Mesh(new THREE.BoxGeometry(0.40 * spec.w, 0.055, 0.27 * spec.w), M.leather);
-  belt.position.y = 0.815;
-  const hips = new THREE.Mesh(new THREE.BoxGeometry(0.37 * spec.w, 0.19, 0.25 * spec.w), M.pants);
-  hips.position.y = 0.74; hips.castShadow = true;
-  body.add(belt, hips);
+  // 脊柱：背上突出来的一节节骨头
+  for (let i = 0; i < 4; i++) {
+    const v = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.035, 0.06), M.bone);
+    v.position.set(0, 1.30 - i * 0.075, -0.115 * W);
+    body.add(v);
+  }
 
-  // ---- 脖子 ----
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.054, 0.062, 0.1, 8), M.skin);
-  neck.position.y = 1.44; neck.castShadow = true;
+  /* ---- 脖子：歪着往前伸 ---- */
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.047, 0.056, 0.12, 8), M.skin);
+  neck.position.set(0, 1.40, 0.035);
+  neck.rotation.x = -0.28;
+  neck.castShadow = true;
   body.add(neck);
 
-  // ---- 头（爆头命中体）：颅骨 + 下颌 + 头发 + 五官 ----
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.165, 16, 14), M.skin);
-  head.scale.set(1, 1.1, 1.02);
-  head.position.y = 1.58; head.castShadow = true;
+  /* ---- 头（爆头命中体）：凹陷的颅骨 + 空洞眼窝 + 脱臼的下颌 ---- */
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.155, 16, 14), M.skin);
+  head.scale.set(0.94, 1.06, 1.0);
+  head.position.set(0, 1.53, 0.05);
+  head.rotation.x = 0.18;                        // 脑袋往前探
+  head.castShadow = true;
   body.add(head);
 
-  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.1, 0.185), M.skin);
-  jaw.position.set(0, -0.1, 0.025);
-  head.add(jaw);
+  // 眼窝：深陷的洞 + 洞里那点荧光
+  const socketMat = new THREE.MeshStandardMaterial({ color: 0x0a0b09, roughness: 0.95, metalness: 0 });
+  const eyeMat = new THREE.MeshStandardMaterial({
+    color: 0x090909, emissive: t.color, emissiveIntensity: 2.4, roughness: 0.25, metalness: 0
+  });
+  for (const s of [1, -1]) {
+    const socket = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8), socketMat);
+    socket.position.set(s * 0.062, 0.014, 0.108);
+    socket.scale.set(1, 0.85, 0.7);
+    head.add(socket);
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.027, 8, 6), eyeMat);
+    eye.position.set(s * 0.062, 0.014, 0.132);
+    head.add(eye);
+    addGlow(eye, t.color, 0.26, 0.85);
+  }
 
-  const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.175, 14, 12), M.hair);
-  hairCap.scale.set(1.06, 0.92, 1.06);
-  hairCap.position.set(0, 0.05, -0.035);     // 往后偏，露出脸
+  // 嘴：黑洞 + 垂着的下颌 + 几颗牙
+  const maw = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.08, 0.05),
+    new THREE.MeshStandardMaterial({ color: 0x140a0a, roughness: 0.9, metalness: 0 }));
+  maw.position.set(0, -0.058, 0.112);
+  head.add(maw);
+  const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.055, 0.10), M.skin);
+  jaw.position.set(0, -0.112, 0.092);
+  jaw.rotation.x = 0.42;                          // 下颌脱臼，挂在脸下
+  head.add(jaw);
+  for (const s of [1, -1]) {
+    for (let i = 0; i < 3; i++) {
+      const tooth = new THREE.Mesh(new THREE.ConeGeometry(0.0105, 0.034, 4), M.bone);
+      tooth.position.set(s * 0.034 + (i - 1) * 0.004, -0.035, 0.128);
+      tooth.rotation.x = Math.PI;                 // 上排牙朝下
+      head.add(tooth);
+      const low = new THREE.Mesh(new THREE.ConeGeometry(0.009, 0.026, 4), M.bone);
+      low.position.set(s * 0.032 + (i - 1) * 0.004, -0.093, 0.122);
+      low.rotation.x = 0.18;
+      jaw.add(low);
+    }
+  }
+
+  // 颅顶：稀疏的残发 + 一块剥掉的头皮
+  const hairCap = new THREE.Mesh(
+    new THREE.SphereGeometry(0.163, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.46), M.hair);
+  hairCap.scale.set(1.04, 0.86, 1.04);
+  hairCap.position.set(0, 0.028, -0.026);
   hairCap.castShadow = true;
   head.add(hairCap);
+  const bald = new THREE.Mesh(new THREE.SphereGeometry(0.062, 8, 6, 0, 6.28, 0, 1.1), M.gore);
+  bald.position.set(0.075, 0.085, 0.045);
+  bald.rotation.set(0.6, 0.4, 0.3);
+  head.add(bald);
 
-  const eyeWhite = new THREE.MeshStandardMaterial({ color: 0xded8d2, roughness: 0.32, metalness: 0 });
-  const irisMat = new THREE.MeshStandardMaterial({ color: 0x17120e, roughness: 0.22, metalness: 0 });
-  const mouthMat = new THREE.MeshStandardMaterial({ color: 0x3a2422, roughness: 0.6, metalness: 0 });
+  /* ---- 肩：露出来的肩骨 ---- */
   for (const s of [1, -1]) {
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.042, 10, 8), eyeWhite);
-    eye.position.set(s * 0.058, 0.012, 0.135);
-    head.add(eye);
-    const iris = new THREE.Mesh(new THREE.SphereGeometry(0.021, 8, 6), irisMat);
-    iris.position.set(s * 0.058, 0.012, 0.163);
-    head.add(iris);
-    const brow = new THREE.Mesh(new THREE.BoxGeometry(0.062, 0.013, 0.015), M.hair);
-    brow.position.set(s * 0.06, 0.068, 0.15);
-    brow.rotation.z = s * 0.12;
-    head.add(brow);
-  }
-  const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.013, 0.012), mouthMat);
-  mouth.position.set(0, -0.068, 0.152);
-  head.add(mouth);
-  for (const s of [1, -1]) {
-    const ear = new THREE.Mesh(new THREE.SphereGeometry(0.036, 8, 6), M.skin);
-    ear.scale.set(0.5, 1, 0.8);
-    ear.position.set(s * 0.152, -0.005, -0.005);
-    head.add(ear);
-  }
-  // 眼部微光：远距离也能看出敌意
-  const visor = addGlow(head, t.color, 0.4, 0.5);
-  visor.position.set(0, 0.012, 0.16);
-
-  // ---- 肩甲 ----
-  const padGeo = new THREE.BoxGeometry(0.2, 0.13, 0.24);
-  for (const s of [1, -1]) {
-    const pad = new THREE.Mesh(padGeo, M.leather);
-    pad.position.set(s * 0.275 * spec.w, 1.34, 0);
-    pad.castShadow = true;
-    body.add(pad);
+    const shoulder = new THREE.Mesh(new THREE.SphereGeometry(0.082, 10, 8), M.bone);
+    shoulder.position.set(s * 0.232 * W, 1.315, 0);
+    body.add(shoulder);
   }
 
-  // ---- 手臂（枢轴在肩）：袖子 + 小臂 + 手 ----
+  /* ---- 手臂（枢轴在肩）：腐肉 + 破袖 + 爪子 ---- */
   const mkArm = (side) => {
     const pivot = new THREE.Group();
-    pivot.position.set(side * 0.285 * spec.w, 1.33, 0);
-    const upper = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.30, 0.125), M.jacket);
-    upper.position.y = -0.15; upper.castShadow = true;
-    const fore = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.28, 0.11), M.skin);
-    fore.position.y = -0.44; fore.castShadow = true;
-    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.115, 0.06), M.skin);
-    hand.position.set(0, -0.635, 0.012); hand.castShadow = true;
-    pivot.add(upper, fore, hand);
+    pivot.position.set(side * 0.245 * W, 1.30, 0);
+    const upper = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.29, 0.11), M.skin);
+    upper.position.y = -0.145; upper.castShadow = true;
+    const sleeve = new THREE.Mesh(new THREE.BoxGeometry(0.115, 0.16, 0.125), M.rags);
+    sleeve.position.y = -0.075;
+    const fore = new THREE.Mesh(new THREE.BoxGeometry(0.085, 0.28, 0.09), M.skin);
+    fore.position.y = -0.43; fore.castShadow = true;
+    const hand = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.10, 0.055), M.skin);
+    hand.position.set(0, -0.62, 0.014); hand.castShadow = true;
+    pivot.add(upper, sleeve, fore, hand);
+    for (let k = -1; k <= 1; k++) {                 // 指甲
+      const claw = new THREE.Mesh(new THREE.ConeGeometry(0.013, 0.078, 4), M.bone);
+      claw.position.set(k * 0.026, -0.688, 0.032);
+      claw.rotation.x = Math.PI * 0.62;
+      pivot.add(claw);
+    }
     body.add(pivot);
     return pivot;
   };
   const armL = mkArm(1), armR = mkArm(-1);
 
-  // ---- 腿（枢轴在髋）：裤 + 靴 ----
+  /* ---- 腿（枢轴在髋）：干瘦的腿 + 破裤管 + 烂鞋 ---- */
   const mkLeg = (side) => {
     const pivot = new THREE.Group();
-    pivot.position.set(side * 0.115 * spec.w, 0.72, 0);
-    const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.155, 0.34, 0.16), M.pants);
-    thigh.position.y = -0.17; thigh.castShadow = true;
-    const shin = new THREE.Mesh(new THREE.BoxGeometry(0.135, 0.32, 0.14), M.pants);
-    shin.position.y = -0.48; shin.castShadow = true;
-    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.145, 0.11, 0.25), M.leather);
-    boot.position.set(0, -0.655, 0.035); boot.castShadow = true;
-    pivot.add(thigh, shin, boot);
+    pivot.position.set(side * 0.105 * W, 0.72, 0);
+    const thigh = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.33, 0.14), M.skin);
+    thigh.position.y = -0.165; thigh.castShadow = true;
+    const trouser = new THREE.Mesh(new THREE.BoxGeometry(0.148, 0.24, 0.158), M.rags);
+    trouser.position.y = -0.10;
+    const shin = new THREE.Mesh(new THREE.BoxGeometry(0.11, 0.31, 0.12), M.skin);
+    shin.position.y = -0.47; shin.castShadow = true;
+    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.125, 0.085, 0.23), M.gore);
+    foot.position.set(0, -0.645, 0.035); foot.castShadow = true;
+    pivot.add(thigh, trouser, shin, foot);
     body.add(pivot);
     return pivot;
   };
   const legL = mkLeg(1), legR = mkLeg(-1);
 
-  // ---- 射手手心的能量球 ----
+  /* ---- 吐酸者：嘴角渗出的酸液 ---- */
   let orb = null;
   if (type === 'shooter') {
-    orb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.12, 0),
+    orb = new THREE.Mesh(new THREE.IcosahedronGeometry(0.085, 0),
       new THREE.MeshBasicMaterial({ color: t.color, toneMapped: false }));
-    orb.position.set(0, -0.72, 0.09);
-    armR.add(orb);
-    addGlow(orb, t.color, 0.8, 0.9);
+    orb.position.set(0, -0.085, 0.135);
+    head.add(orb);
+    addGlow(orb, t.color, 0.55, 0.9);
   }
-  // ---- 首领的背光光环 ----
+
+  /* ---- 尸王：背后一圈悬浮的骨环 ---- */
   if (type === 'boss') {
     const ringMat = new THREE.MeshBasicMaterial({
-      color: 0xff9ec4, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
+      color: 0xff6a92, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
     });
     const r1 = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.05, 8, 44), ringMat); r1.rotation.x = Math.PI / 2; r1.position.y = 1.0;
     const r2 = new THREE.Mesh(new THREE.TorusGeometry(1.8, 0.04, 8, 44), ringMat); r2.rotation.y = Math.PI / 2; r2.position.y = 1.0;
@@ -2297,10 +2508,10 @@ function makeHumanoid(type) {
     body.userData.rings = [r1, r2];
   }
 
-  const glow = addGlow(body, t.color, type === 'boss' ? 2.6 : 0.9, 0.55);
+  const glow = addGlow(body, t.color, type === 'boss' ? 2.6 : 0.8, 0.5);
   // 轮廓光：放大一点的背面副本，在暗背景里勾出边缘
   const rimMat = new THREE.MeshBasicMaterial({
-    color: t.color, transparent: true, opacity: 0.5, side: THREE.BackSide,
+    color: t.color, transparent: true, opacity: 0.45, side: THREE.BackSide,
     blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false
   });
   const mkRim = (src, scale) => {
@@ -2314,14 +2525,13 @@ function makeHumanoid(type) {
   };
   mkRim(torso, 1.09);
   mkRim(head, 1.14);
-  for (const s of [1, -1]) {
-    const pad = body.children.find(o => o.isMesh && o.geometry === padGeo && o.position.x === s * 0.275 * spec.w);
-    if (pad) mkRim(pad, 1.12);
-  }
+
   root.scale.setScalar(spec.s);
-  return { root, body, torso, head, chest, armL, armR, legL, legR, visor, orb, glow, spec, mats: M, rimMat,
-           top: (1.76 + 0.1) * spec.s };
+  return { root, body, torso, head, chest, hips, armL, armR, legL, legR, orb, glow, spec, mats: M, rimMat,
+           // 僵尸的招牌姿势：双臂前伸（rotation.x 为负 = 朝前）、身体前倾
+           armBase: -1.12, hunch: 0.17, top: (1.72 + 0.1) * spec.s };
 }
+
 /* ---------- 巨兽（哥斯拉型）：四足 + 长尾 + 背板 + 原子吐息 ----------
  * 坐标约定：模型**面朝 +Z**（updateEnemies 用 lookAt(player) 把 +Z 对准玩家），
  * 脚底在 y = 0，模型总高约 2.9 单位，最后用 root.scale = spec.s 放大到 ~5 m。
@@ -2338,8 +2548,12 @@ function makeKaiju(type) {
     scale: MAT.kaijuScale.clone(),
     belly: MAT.kaijuBelly.clone(),
     plate: MAT.kaijuPlate.clone(),
-    eye: new THREE.MeshStandardMaterial({ color: 0xffb03d, emissive: 0xff7a33, emissiveIntensity: 1.5, roughness: 0.3, metalness: 0.1 })
+    eye: new THREE.MeshStandardMaterial({ color: 0xffd24a, emissive: 0xe0b83c, emissiveIntensity: 1.5, roughness: 0.3, metalness: 0.1 })
   };
+  // 腐化巨兽：鳞甲从青灰变成病态的橄榄绿，腹板发白，背板像骨头
+  M.scale.color.setHSL(0.20, 0.26, 0.52);
+  M.belly.color.setHSL(0.16, 0.20, 0.66);
+  M.plate.color.setHSL(0.10, 0.12, 0.55);
 
   const put = (geo, mat, x, y, z, parent) => {
     const m = new THREE.Mesh(geo, mat);
@@ -2402,16 +2616,16 @@ function makeKaiju(type) {
   }
   for (const s of [1, -1]) {
     const eye = put(new THREE.SphereGeometry(0.075, 10, 8), M.eye, s * 0.23, 0.10, 0.30, head);
-    addGlow(eye, 0xff7a33, 0.34, 0.7);
+    addGlow(eye, 0xe0b83c, 0.34, 0.7);
     put(new THREE.BoxGeometry(0.07, 0.05, 0.08), M.scale, s * 0.13, 0.02, 0.66, head);   // 鼻孔
   }
-  // 原子吐息的蓄能球：只在蓄力时出现，从嘴里亮出来
+  // 原子吐息的蓄能球：只在蓄力时出现，从嘴里亮出来（腐酸，偏绿）
   const breath = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 10),
-    new THREE.MeshBasicMaterial({ color: 0x4fd8ff, transparent: true, opacity: 0.9, toneMapped: false }));
+    new THREE.MeshBasicMaterial({ color: 0x9ef03a, transparent: true, opacity: 0.9, toneMapped: false }));
   breath.position.set(0, -0.12, 0.42);
   breath.visible = false;
   head.add(breath);
-  const breathGlow = addGlow(breath, 0x4fd8ff, 1.3, 0.9);
+  const breathGlow = addGlow(breath, 0x9ef03a, 1.3, 0.9);
 
   /* ---- 背板：颈后到尾根一路缩小。前几块贴在躯干上，后几块挂在**尾巴枢轴**上，
    *      这样尾巴摆动时背板跟着走，而不是悬在半空。 ---- */
@@ -2473,7 +2687,7 @@ function spawnEnemy(type, x, z) {
   if (typeof x !== 'number') { const p = spawnPoint(); x = p.x; z = p.z; }
   const t = ENEMY_TYPES[type];
   const hp = t.hp * (type === 'boss' ? 1 : 1 + (wave - 1) * 0.08);
-  const hm = type === 'kaiju' ? makeKaiju(type) : makeHumanoid(type);
+  const hm = type === 'kaiju' ? makeKaiju(type) : makeZombie(type);
   const mesh = hm.root;
   mesh.position.set(x, 0, z);
   scene.add(mesh);
@@ -2906,17 +3120,17 @@ const PROJ_G = 16;                 // 投掷物的重力
 function fireBullets(e, count, spread, speed, offset = 0, dmg = 9) {
   const base = Math.atan2(player.z - e.z, player.x - e.x) + offset;
   // 开火枪口闪光（让玩家看得见敌人正在射击）
-  const flash = addGlow(scene, 0xff3d7f, 1.5, 0.95);
+  const flash = addGlow(scene, e.color, 1.5, 0.95);
   flash.position.set(e.x + Math.cos(base) * (e.r + 0.5), e.y, e.z + Math.sin(base) * (e.r + 0.5));
   flashes.push({ s: flash, t: 0.09 });
   for (let i = 0; i < count; i++) {
     const a = base + (count === 1 ? 0 : (i - (count - 1) / 2) * spread);
     const mesh = new THREE.Mesh(
       new THREE.CylinderGeometry(0.05, 0.05, 0.55, 6),
-      new THREE.MeshBasicMaterial({ color: 0xff3d7f, toneMapped: false })
+      new THREE.MeshBasicMaterial({ color: e.color, toneMapped: false })
     );
     mesh.geometry.rotateX(Math.PI / 2);   // 长轴沿 +Z
-    const gl = addGlow(mesh, 0xff3d7f, 1.0, 0.9);
+    const gl = addGlow(mesh, e.color, 1.0, 0.9);
     const x = e.x + Math.cos(a) * (e.r + 0.4), z = e.z + Math.sin(a) * (e.r + 0.4);
     mesh.position.set(x, e.y, z);
     mesh.lookAt(x + Math.cos(a) * 10, e.y, z + Math.sin(a) * 10);
@@ -2961,17 +3175,17 @@ function fireBreath(e) {
   const vy = (player.y - mouth.y) / t;            // 略微俯射，让束线落到玩家高度
   const mesh = new THREE.Mesh(
     new THREE.CylinderGeometry(0.16, 0.34, 1.6, 10, 1, true),
-    neonMat(0xffffff, 0x4fd8ff, 2.6)
+    neonMat(0xffffff, 0x9ef03a, 2.6)
   );
   mesh.geometry.rotateX(Math.PI / 2);             // 长轴沿 +Z，和 lookAt 的朝向一致
-  const gl = addGlow(mesh, 0x4fd8ff, 1.7, 0.95);
+  const gl = addGlow(mesh, 0x9ef03a, 1.7, 0.95);
   mesh.position.set(mouth.x, mouth.y, mouth.z);
   mesh.lookAt(player.x, player.y, player.z);
   scene.add(mesh);
   bullets.push({
     kind: 'breath', x: mouth.x, y: mouth.y, z: mouth.z,
     vx: (dx / d) * speed, vy, vz: (dz / d) * speed,
-    r: 0.55, dmg: 26, life: 2.2, mesh, glow: gl, spin: 0, color: 0x4fd8ff
+    r: 0.55, dmg: 26, life: 2.2, mesh, glow: gl, spin: 0, color: 0x9ef03a
   });
   projLog.push({ kind: 'breath', x: mouth.x, z: mouth.z, y: mouth.y, vy, speed, t: performance.now() });
   SFX.breath();
@@ -3052,7 +3266,7 @@ function updateEnemies(dt) {
       e.throwCd -= dt;
       if (e.throwCd <= 0) {
         e.throwCd = 3.4;
-        throwObject(e, 11, 2.6, 20, 0xff2f6d);       // 首领的燃烧弹
+        throwObject(e, 11, 2.6, 20, 0xff5a2a);       // 尸王的燃烧弹
       }
       e.summonCd -= dt;
       if (e.summonCd <= 0) {
@@ -3147,14 +3361,14 @@ function updateEnemies(dt) {
       }
       if (e.throwCd <= 0) {
         e.throwCd = rand(2.6, 4.0);
-        throwObject(e, 10, 2.0, 16, 0xc04dff);      // 投掷：会爆的能量块
+        throwObject(e, 10, 2.0, 16, 0xc8f24a);      // 投掷：会爆的酸液团
       }
     }
     if (e.type === 'tank') {
       e.throwCd -= dt;
       if (e.throwCd <= 0) {
         e.throwCd = rand(3.0, 4.6);
-        throwObject(e, 8, 2.8, 22, 0x39d98a);        // 重装兵的迫击式投掷
+        throwObject(e, 8, 2.8, 22, 0x5fd97a);        // 碎骨者的胆汁迫击弹
       }
     }
     if (d < e.r + P_R + 0.25 && e.atkCd <= 0) {
@@ -3178,21 +3392,23 @@ function updateEnemies(dt) {
       // 行走循环：腿/手臂交替摆动，速度越快步频越高
       const moveK = clamp(sp / Math.max(0.001, e.speed), 0, 1.6);
       const ph = e.phase * hm.spec.walk * (0.35 + moveK * 0.75);
-      const stride = 0.55 * (0.3 + moveK * 0.9);
+      const stride = 0.42 * (0.3 + moveK * 0.9);
       hm.legL.rotation.x = Math.sin(ph) * stride;
       hm.legR.rotation.x = Math.sin(ph + Math.PI) * stride;
-      hm.armL.rotation.x = Math.sin(ph + Math.PI) * stride * 0.8;
-      hm.armR.rotation.x = Math.sin(ph) * stride * 0.8;
-      hm.armL.rotation.z = 0.1; hm.armR.rotation.z = -0.1;
-      // 身体起伏 + 前倾
+      // 僵尸的招牌姿势：双臂一直前伸着，只有小幅度的抽搐
+      const armBase = hm.armBase;
+      hm.armL.rotation.x = armBase + Math.sin(ph + Math.PI) * stride * 0.30;
+      hm.armR.rotation.x = armBase + Math.sin(ph) * stride * 0.30;
+      hm.armL.rotation.z = 0.16; hm.armR.rotation.z = -0.16;
+      // 身体起伏 + 前倾（驼背）
       hm.body.position.y = Math.abs(Math.sin(ph)) * 0.045;
-      hm.body.rotation.x = e.type === 'tank' ? 0.08 : 0;
-      // 近战挥击
+      hm.body.rotation.x = hm.hunch + (e.type === 'tank' ? 0.06 : 0);
+      // 近战抓挠
       if (e.swing > 0) {
         e.swing = Math.max(0, e.swing - dt * 3.2);
         const s = Math.sin(e.swing * Math.PI);
-        hm.armR.rotation.x = -1.9 * s;
-        hm.body.rotation.x -= 0.25 * s;
+        hm.armR.rotation.x = armBase - 0.85 * s;
+        hm.body.rotation.x += 0.18 * s;
       }
       // 投掷动作：手臂高举后甩出
       if (e.throwAnim > 0) {
@@ -3374,11 +3590,11 @@ function damagePlayer(dmg) {
 }
 function startWave() {
   wave++;
-  // 疾行者（黄色高速突进）已取消：压力改由更多冲锋兵 + 巨兽承担
+  // 疾行者（黄色高速突进）已取消：压力改由更多游荡者 + 腐化巨兽承担
   const kaijuCount = wave >= 3 ? clamp(Math.floor(wave / 4), 1, 3) : 0;
   banner = {
     title: `第 ${wave} 波`,
-    sub: wave % 5 === 0 ? '警告：首领单位来袭' : (kaijuCount > 0 ? '警告：巨兽出没' : ''),
+    sub: wave % 5 === 0 ? '警告：尸王降临' : (kaijuCount > 0 ? '警告：腐化巨兽出没' : ''),
     t: 2.2
   };
   SFX.wave();
